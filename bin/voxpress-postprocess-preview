@@ -1,0 +1,190 @@
+#!/usr/bin/env python3
+import os
+import json
+import subprocess
+import sys
+
+from opencc import OpenCC
+
+
+XDOTOOL = os.environ.get(
+    "VOXTYPE_XDOTOOL", os.environ.get("VOXPRESS_XDOTOOL", "xdotool")
+)
+POPUP_UI = os.environ.get(
+    "VOXTYPE_POPUP_UI", os.path.expanduser("~/.local/bin/voxpress-popup-ui")
+)
+RUNTIME_DIR = os.environ.get("XDG_RUNTIME_DIR", f"/tmp/voxtype-{os.getuid()}")
+STATE_DIR = os.path.join(RUNTIME_DIR, "voxtype")
+TARGET_WINDOW_FILE = os.path.join(STATE_DIR, "target_window")
+EXPECTED_PASTE_FILE = os.path.join(STATE_DIR, "expected_paste_text")
+CONFIG_PATH = os.environ.get(
+    "VOXTYPE_POPUP_SETTINGS",
+    os.environ.get("VOXPRESS_SETTINGS", os.path.expanduser("~/.config/voxpress/settings.json")),
+)
+
+
+def bool_from_env(value: str | None) -> bool | None:
+    if value is None:
+        return None
+    normalized = value.strip().lower()
+    if normalized in ("1", "true", "yes", "on"):
+        return True
+    if normalized in ("0", "false", "no", "off"):
+        return False
+    return None
+
+
+def should_append_newline() -> bool:
+    override = bool_from_env(os.environ.get("VOXTYPE_APPEND_NEWLINE"))
+    if override is not None:
+        return override
+    try:
+        with open(CONFIG_PATH, "r", encoding="utf-8") as handle:
+            settings = json.load(handle)
+    except (OSError, json.JSONDecodeError):
+        return True
+    return bool(settings.get("append_newline", True))
+
+
+def append_output_newline(text: str) -> str:
+    if not text or not should_append_newline():
+        return text
+    return text if text.endswith("\n") else f"{text}\n"
+
+
+def get_active_window() -> str | None:
+    try:
+        result = subprocess.run(
+            [XDOTOOL, "getactivewindow"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            timeout=1,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+
+    window = result.stdout.strip()
+    return window or None
+
+
+def get_target_window() -> str | None:
+    try:
+        with open(TARGET_WINDOW_FILE, encoding="utf-8") as handle:
+            window = handle.read().strip()
+    except OSError:
+        return None
+    return window or None
+
+
+def write_expected_paste(text: str) -> None:
+    try:
+        os.makedirs(STATE_DIR, exist_ok=True)
+        if not text.strip():
+            try:
+                os.unlink(EXPECTED_PASTE_FILE)
+            except FileNotFoundError:
+                pass
+            return
+
+        tmp_path = f"{EXPECTED_PASTE_FILE}.tmp"
+        with open(tmp_path, "w", encoding="utf-8") as handle:
+            handle.write(text)
+        os.replace(tmp_path, EXPECTED_PASTE_FILE)
+    except OSError:
+        pass
+
+
+def restore_focus(window: str | None) -> None:
+    if not window or os.environ.get("VOXTYPE_RESTORE_FOCUS", "1") == "0":
+        return
+
+    try:
+        subprocess.run(
+            [XDOTOOL, "windowactivate", "--sync", window],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=2,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+
+
+def edit_preview(text: str) -> str:
+    if os.environ.get("VOXTYPE_PREVIEW", "1") == "0":
+        return text
+    if os.environ.get("VOXTYPE_PREVIEW_MODE", "gtk") != "gtk":
+        notify_preview(text)
+        return text
+    if not os.environ.get("DISPLAY"):
+        notify_preview(text)
+        return text
+
+    target_window = get_target_window() or get_active_window()
+    cmd = [POPUP_UI, "preview"]
+    if target_window:
+        cmd.extend(["--reference-window", target_window])
+    try:
+        result = subprocess.run(
+            cmd,
+            input=text,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            check=False,
+        )
+    except OSError:
+        notify_preview(text)
+        return text
+    finally:
+        restore_focus(target_window)
+
+    if result.returncode == 0:
+        return result.stdout
+    return os.environ.get("VOXTYPE_PREVIEW_CANCEL_OUTPUT", "")
+
+
+def notify_preview(text: str) -> None:
+    if os.environ.get("VOXTYPE_PREVIEW", "1") == "0":
+        return
+
+    preview = text.replace("\n", " ").strip()
+    if not preview:
+        return
+    if len(preview) > 220:
+        preview = preview[:217] + "..."
+
+    try:
+        subprocess.Popen(
+            [
+                "/usr/bin/notify-send",
+                "-a",
+                "Voxpress",
+                "-u",
+                os.environ.get("VOXTYPE_PREVIEW_URGENCY", "normal"),
+                "-t",
+                os.environ.get("VOXTYPE_PREVIEW_TIMEOUT_MS", "5000"),
+                "Voxpress preview",
+                preview,
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    except OSError:
+        pass
+
+
+def main() -> int:
+    text = sys.stdin.read()
+    converted = OpenCC("t2s").convert(text)
+    final_text = edit_preview(converted).strip()
+    final_text = append_output_newline(final_text)
+    write_expected_paste(final_text)
+    sys.stdout.write(final_text)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

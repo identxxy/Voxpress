@@ -1,0 +1,21 @@
+{
+  "window_opacity": 0.9,
+  "panel_alpha": 0.9,
+  "text_bg_alpha": 0.9,
+  "button_alpha": 0.8,
+  "label_font_size": 18,
+  "title_font_size": 20,
+  "text_font_size": 18,
+  "border_radius": 24,
+  "status_width": 240,
+  "status_height": 80,
+  "preview_width": 720,
+  "preview_height": 320,
+  "horizontal_fraction": 0.5,
+  "vertical_fraction": 0.75,
+  "append_newline": true,
+  "language_mode": "zh_en",
+  "trigger_key": "Pause",
+  "confirm_key": "Return",
+  "cancel_key": "Scroll_Lock"
+}

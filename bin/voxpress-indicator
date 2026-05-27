@@ -1,0 +1,583 @@
+#!/usr/bin/python3
+import argparse
+import json
+import os
+import subprocess
+import sys
+import tempfile
+
+import gi
+
+gi.require_version("Gtk", "3.0")
+gi.require_version("AyatanaAppIndicator3", "0.1")
+from gi.repository import AyatanaAppIndicator3 as AppIndicator, GLib, Gtk
+
+
+SERVICE = "voxpress-pause-listener.service"
+CONFIG_PATH = os.environ.get(
+    "VOXTYPE_POPUP_SETTINGS",
+    os.environ.get("VOXPRESS_SETTINGS", os.path.expanduser("~/.config/voxpress/settings.json")),
+)
+VOXTYPE_CONFIG_PATH = os.environ.get(
+    "VOXTYPE_CONFIG_PATH", os.path.expanduser("~/.config/voxtype/config.toml")
+)
+POPUP_UI = os.environ.get(
+    "VOXTYPE_POPUP_UI", os.path.expanduser("~/.local/bin/voxpress-popup-ui")
+)
+ENABLE_SCRIPT = os.environ.get(
+    "VOXTYPE_PAUSE_ENABLE", os.path.expanduser("~/.local/bin/voxpress-pause-enable")
+)
+DISABLE_SCRIPT = os.environ.get(
+    "VOXTYPE_PAUSE_DISABLE", os.path.expanduser("~/.local/bin/voxpress-pause-disable")
+)
+
+DEFAULT_SETTINGS = {
+    "window_opacity": 1.00,
+    "panel_alpha": 0.86,
+    "text_bg_alpha": 0.90,
+    "button_alpha": 0.88,
+    "label_font_size": 16,
+    "title_font_size": 19,
+    "text_font_size": 18,
+    "border_radius": 9,
+    "status_width": 240,
+    "status_height": 52,
+    "preview_width": 720,
+    "preview_height": 240,
+    "horizontal_fraction": 0.50,
+    "vertical_fraction": 0.75,
+    "append_newline": True,
+    "language_mode": "zh_en",
+    "trigger_key": "Pause",
+    "confirm_key": "Return",
+    "cancel_key": "Scroll_Lock",
+}
+
+SETTING_LIMITS = {
+    "window_opacity": (0.72, 1.0),
+    "panel_alpha": (0.45, 1.0),
+    "text_bg_alpha": (0.45, 1.0),
+    "button_alpha": (0.45, 1.0),
+    "label_font_size": (12, 28),
+    "title_font_size": (13, 32),
+    "text_font_size": (12, 32),
+    "border_radius": (0, 24),
+    "status_width": (180, 1000),
+    "status_height": (42, 240),
+    "preview_width": (420, 1400),
+    "preview_height": (160, 900),
+    "horizontal_fraction": (0.05, 0.95),
+    "vertical_fraction": (0.20, 0.90),
+}
+
+SETTING_LABELS = {
+    "window_opacity": "Window opacity",
+    "panel_alpha": "Panel opacity",
+    "text_bg_alpha": "Text box opacity",
+    "button_alpha": "Button opacity",
+    "label_font_size": "Description font size",
+    "title_font_size": "Title/status font size",
+    "text_font_size": "Preview text font size",
+    "border_radius": "Corner radius",
+    "status_width": "Status window width",
+    "status_height": "Status window height",
+    "preview_width": "Preview window width",
+    "preview_height": "Preview window height",
+    "horizontal_fraction": "Horizontal position",
+    "vertical_fraction": "Vertical position",
+    "append_newline": "Append newline",
+    "language_mode": "Recognition language",
+    "trigger_key": "Hold-to-talk key",
+    "confirm_key": "Preview confirm key",
+    "cancel_key": "Preview cancel key",
+}
+
+SETTING_HINTS = {
+    "window_opacity": "This fades the whole popup, including text; keep 1.00 for crisp text.",
+    "panel_alpha": "Higher values make the popup darker.",
+    "text_bg_alpha": "Higher values make the editable preview area darker.",
+    "button_alpha": "Higher values make buttons darker.",
+    "horizontal_fraction": "0.50 is screen center.",
+    "vertical_fraction": "0.50 is screen center; 0.75 is lower quarter.",
+    "language_mode": "Uses the current multilingual large-v3-turbo model.",
+    "trigger_key": "Restarting the listener applies this key.",
+    "confirm_key": "This key confirms the preview popup.",
+    "cancel_key": "This key cancels the preview popup and leaves Delete free for editing.",
+}
+
+FLOAT_SETTINGS = {
+    "window_opacity",
+    "panel_alpha",
+    "text_bg_alpha",
+    "button_alpha",
+    "horizontal_fraction",
+    "vertical_fraction",
+}
+
+BOOLEAN_SETTINGS = {"append_newline"}
+PREVIEW_KEY_CHOICES = {
+    "Pause": "Pause",
+    "Scroll_Lock": "Scroll Lock",
+    "Return": "Enter",
+    "Escape": "Escape",
+    "Delete": "Delete",
+    "BackSpace": "Backspace",
+    "Insert": "Insert",
+    "F9": "F9",
+    "F10": "F10",
+    "F11": "F11",
+    "F12": "F12",
+    "XF86AudioMicMute": "Mic mute",
+    "XF86AudioRecord": "Audio Record",
+    "XF86AudioPlay": "Audio Play/Pause",
+}
+
+TRIGGER_KEY_CHOICES = {
+    "Pause": "Pause",
+    "Scroll_Lock": "Scroll Lock",
+    "F9": "F9",
+    "F10": "F10",
+    "F11": "F11",
+    "F12": "F12",
+    "XF86AudioMicMute": "Mic mute",
+    "XF86AudioRecord": "Audio Record",
+    "XF86AudioPlay": "Audio Play/Pause",
+}
+
+CHOICE_SETTINGS = {
+    "language_mode": {
+        "zh_en": "Chinese + English",
+        "zh": "Chinese only",
+        "en": "English only",
+        "auto": "Auto all languages",
+    },
+    "trigger_key": TRIGGER_KEY_CHOICES,
+    "confirm_key": PREVIEW_KEY_CHOICES,
+    "cancel_key": PREVIEW_KEY_CHOICES,
+}
+
+LANGUAGE_TOML = {
+    "zh_en": '["en", "zh"]',
+    "zh": '"zh"',
+    "en": '"en"',
+    "auto": '"auto"',
+}
+
+
+def clamp(value, low, high):
+    return min(max(value, low), high)
+
+
+def normalize_settings(raw):
+    settings = dict(DEFAULT_SETTINGS)
+    if isinstance(raw, dict):
+        settings.update({key: raw[key] for key in settings.keys() & raw.keys()})
+
+    normalized = {}
+    for key, default in DEFAULT_SETTINGS.items():
+        if key in BOOLEAN_SETTINGS:
+            normalized[key] = bool(settings.get(key, default))
+            continue
+        if key in CHOICE_SETTINGS:
+            value = str(settings.get(key, default))
+            normalized[key] = value if value in CHOICE_SETTINGS[key] else default
+            continue
+        low, high = SETTING_LIMITS[key]
+        try:
+            value = float(settings.get(key, default))
+        except (TypeError, ValueError):
+            value = float(default)
+        value = clamp(value, low, high)
+        if key not in FLOAT_SETTINGS:
+            value = int(round(value))
+        normalized[key] = value
+    return normalized
+
+
+def load_settings():
+    try:
+        with open(CONFIG_PATH, "r", encoding="utf-8") as handle:
+            raw = json.load(handle)
+    except (OSError, json.JSONDecodeError):
+        raw = {}
+    return normalize_settings(raw)
+
+
+def save_settings(settings):
+    normalized = normalize_settings(settings)
+    os.makedirs(os.path.dirname(CONFIG_PATH), exist_ok=True)
+    fd, tmp_path = tempfile.mkstemp(
+        prefix=".popup-ui-settings-", suffix=".json", dir=os.path.dirname(CONFIG_PATH)
+    )
+    with os.fdopen(fd, "w", encoding="utf-8") as handle:
+        json.dump(normalized, handle, ensure_ascii=False, indent=2)
+        handle.write("\n")
+    os.replace(tmp_path, CONFIG_PATH)
+    return normalized
+
+
+def update_toml_key(path, section, key, value_literal):
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            lines = handle.readlines()
+    except OSError:
+        return False
+
+    section_header = f"[{section}]"
+    in_section = False
+    changed = False
+    inserted = False
+    output = []
+
+    for line in lines:
+        stripped = line.strip()
+        if stripped.startswith("[") and stripped.endswith("]"):
+            if in_section and not inserted:
+                output.append(f"{key} = {value_literal}\n")
+                changed = True
+                inserted = True
+            in_section = stripped == section_header
+
+        if in_section and stripped.startswith(f"{key} "):
+            new_line = f"{key} = {value_literal}\n"
+            output.append(new_line)
+            changed = changed or line != new_line
+            inserted = True
+            continue
+
+        output.append(line)
+
+    if in_section and not inserted:
+        output.append(f"{key} = {value_literal}\n")
+        changed = True
+
+    if not changed:
+        return False
+
+    fd, tmp_path = tempfile.mkstemp(
+        prefix=".config-", suffix=".toml", dir=os.path.dirname(path)
+    )
+    with os.fdopen(fd, "w", encoding="utf-8") as handle:
+        handle.writelines(output)
+    os.replace(tmp_path, path)
+    return True
+
+
+def apply_voxtype_language(settings):
+    mode = settings.get("language_mode", DEFAULT_SETTINGS["language_mode"])
+    value_literal = LANGUAGE_TOML.get(mode, LANGUAGE_TOML[DEFAULT_SETTINGS["language_mode"]])
+    changed = update_toml_key(VOXTYPE_CONFIG_PATH, "whisper", "language", value_literal)
+    if changed:
+        systemctl("restart", "voxtype.service")
+    return changed
+
+
+def run(cmd, timeout=8):
+    return subprocess.run(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        timeout=timeout,
+        check=False,
+    )
+
+
+def systemctl(*args):
+    return run(["systemctl", "--user", *args], timeout=12)
+
+
+def service_active():
+    return systemctl("is-active", "--quiet", SERVICE).returncode == 0
+
+
+def notify(summary, body=""):
+    try:
+        subprocess.Popen(
+            ["notify-send", summary, body],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+    except OSError:
+        pass
+
+
+def hide_popup():
+    try:
+        subprocess.run(
+            [POPUP_UI, "hide"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=2,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+
+
+class SettingsDialog(Gtk.Dialog):
+    def __init__(self):
+        super().__init__(title="Voxpress Settings")
+        self.set_default_size(500, 560)
+        self.set_keep_above(True)
+        self.controls = {}
+        self.settings = load_settings()
+
+        self.add_button("Reset Defaults", 1001)
+        self.add_button("Cancel", Gtk.ResponseType.CANCEL)
+        self.add_button("Save", Gtk.ResponseType.OK)
+
+        content = self.get_content_area()
+        content.set_border_width(14)
+        grid = Gtk.Grid(column_spacing=12, row_spacing=8)
+        content.add(grid)
+
+        row = 0
+        for key in (
+            "window_opacity",
+            "panel_alpha",
+            "text_bg_alpha",
+            "button_alpha",
+            "label_font_size",
+            "title_font_size",
+            "text_font_size",
+            "border_radius",
+            "status_width",
+            "status_height",
+            "preview_width",
+            "preview_height",
+            "horizontal_fraction",
+            "vertical_fraction",
+        ):
+            self.add_spin(grid, row, key)
+            row += 1
+        self.add_check(grid, row, "append_newline")
+        row += 1
+        self.add_choice(grid, row, "language_mode")
+        row += 1
+        self.add_choice(grid, row, "trigger_key")
+        row += 1
+        self.add_choice(grid, row, "confirm_key")
+        row += 1
+        self.add_choice(grid, row, "cancel_key")
+
+        self.show_all()
+
+    def add_spin(self, grid, row, key):
+        low, high = SETTING_LIMITS[key]
+        is_float = key in FLOAT_SETTINGS
+        step = 0.02 if is_float else 1
+        page = 0.10 if is_float else 10
+        digits = 2 if is_float else 0
+
+        label = Gtk.Label(label=SETTING_LABELS[key])
+        label.set_xalign(0.0)
+        grid.attach(label, 0, row, 1, 1)
+
+        adjustment = Gtk.Adjustment(
+            value=self.settings[key],
+            lower=low,
+            upper=high,
+            step_increment=step,
+            page_increment=page,
+            page_size=0,
+        )
+        spin = Gtk.SpinButton(adjustment=adjustment, climb_rate=step, digits=digits)
+        spin.set_numeric(True)
+        spin.set_hexpand(True)
+        if key in SETTING_HINTS:
+            spin.set_tooltip_text(SETTING_HINTS[key])
+        grid.attach(spin, 1, row, 1, 1)
+        self.controls[key] = spin
+
+    def add_check(self, grid, row, key):
+        label = Gtk.Label(label=SETTING_LABELS[key])
+        label.set_xalign(0.0)
+        grid.attach(label, 0, row, 1, 1)
+
+        check = Gtk.CheckButton(label="Enabled")
+        check.set_active(bool(self.settings[key]))
+        check.set_halign(Gtk.Align.START)
+        grid.attach(check, 1, row, 1, 1)
+        self.controls[key] = check
+
+    def add_choice(self, grid, row, key):
+        label = Gtk.Label(label=SETTING_LABELS[key])
+        label.set_xalign(0.0)
+        grid.attach(label, 0, row, 1, 1)
+
+        combo = Gtk.ComboBoxText()
+        for value, display in CHOICE_SETTINGS[key].items():
+            combo.append(value, display)
+        combo.set_active_id(self.settings[key])
+        combo.set_hexpand(True)
+        if key in SETTING_HINTS:
+            combo.set_tooltip_text(SETTING_HINTS[key])
+        grid.attach(combo, 1, row, 1, 1)
+        self.controls[key] = combo
+
+    def reset_defaults(self):
+        for key, value in DEFAULT_SETTINGS.items():
+            control = self.controls[key]
+            if key in BOOLEAN_SETTINGS:
+                control.set_active(bool(value))
+            elif key in CHOICE_SETTINGS:
+                control.set_active_id(value)
+            else:
+                control.set_value(value)
+
+    def collect(self):
+        values = {}
+        for key, control in self.controls.items():
+            if key in BOOLEAN_SETTINGS:
+                values[key] = control.get_active()
+            elif key in CHOICE_SETTINGS:
+                values[key] = control.get_active_id() or DEFAULT_SETTINGS[key]
+            else:
+                values[key] = control.get_value() if key in FLOAT_SETTINGS else control.get_value_as_int()
+        return values
+
+
+class VoxtypeIndicator:
+    def __init__(self):
+        self.indicator = AppIndicator.Indicator.new(
+            "voxpress",
+            "audio-input-microphone",
+            AppIndicator.IndicatorCategory.APPLICATION_STATUS,
+        )
+        self.indicator.set_status(AppIndicator.IndicatorStatus.ACTIVE)
+        self.menu = Gtk.Menu()
+        self.settings_dialog = None
+        self.build_menu()
+        self.indicator.set_menu(self.menu)
+        self.refresh()
+        GLib.timeout_add_seconds(3, self.refresh)
+
+    def build_menu(self):
+        self.status_item = Gtk.MenuItem(label="Voxpress: Checking")
+        self.status_item.set_sensitive(False)
+        self.menu.append(self.status_item)
+
+        self.menu.append(Gtk.SeparatorMenuItem())
+
+        self.enable_item = Gtk.MenuItem(label="Enable Pause Input")
+        self.enable_item.connect("activate", self.enable)
+        self.menu.append(self.enable_item)
+
+        self.disable_item = Gtk.MenuItem(label="Disable Pause Input")
+        self.disable_item.connect("activate", self.disable)
+        self.menu.append(self.disable_item)
+
+        restart_item = Gtk.MenuItem(label="Restart Listener")
+        restart_item.connect("activate", self.restart)
+        self.menu.append(restart_item)
+
+        self.menu.append(Gtk.SeparatorMenuItem())
+
+        settings_item = Gtk.MenuItem(label="Settings...")
+        settings_item.connect("activate", self.open_settings)
+        self.menu.append(settings_item)
+
+        quit_item = Gtk.MenuItem(label="Quit Indicator")
+        quit_item.connect("activate", self.quit)
+        self.menu.append(quit_item)
+        self.menu.show_all()
+
+    def refresh(self):
+        active = service_active()
+        self.status_item.set_label("Voxpress: Enabled" if active else "Voxpress: Disabled")
+        self.enable_item.set_sensitive(not active)
+        self.disable_item.set_sensitive(active)
+        icon = "audio-input-microphone" if active else "audio-input-microphone-muted"
+        try:
+            self.indicator.set_icon_full(icon, self.status_item.get_label())
+        except AttributeError:
+            self.indicator.set_icon(icon)
+        return True
+
+    def enable(self, *_args):
+        result = run([ENABLE_SCRIPT], timeout=12)
+        if result.returncode != 0:
+            notify("Voxpress enable failed", result.stderr.strip())
+        self.refresh()
+
+    def disable(self, *_args):
+        result = run([DISABLE_SCRIPT], timeout=12)
+        if result.returncode != 0:
+            notify("Voxpress disable failed", result.stderr.strip())
+        self.refresh()
+
+    def restart(self, *_args):
+        result = systemctl("restart", SERVICE)
+        if result.returncode != 0:
+            notify("Voxpress restart failed", result.stderr.strip())
+        self.refresh()
+
+    def open_settings(self, *_args):
+        if self.settings_dialog and self.settings_dialog.get_visible():
+            self.settings_dialog.present()
+            return
+
+        dialog = SettingsDialog()
+        self.settings_dialog = dialog
+        while True:
+            response = dialog.run()
+            if response == 1001:
+                dialog.reset_defaults()
+                continue
+            if response == Gtk.ResponseType.OK:
+                old_settings = load_settings()
+                settings = save_settings(dialog.collect())
+                language_changed = apply_voxtype_language(settings)
+                trigger_changed = settings["trigger_key"] != old_settings["trigger_key"]
+                preview_key_changed = (
+                    settings["confirm_key"] != old_settings["confirm_key"]
+                    or settings["cancel_key"] != old_settings["cancel_key"]
+                )
+                listener_restarted = False
+                if trigger_changed:
+                    result = systemctl("restart", SERVICE)
+                    listener_restarted = result.returncode == 0
+                    if result.returncode != 0:
+                        notify("Voxpress listener restart failed", result.stderr.strip())
+                hide_popup()
+                body = "New popup settings apply on the next popup."
+                if language_changed:
+                    body += " Voxtype was restarted for the language change."
+                if listener_restarted:
+                    body += " Listener was restarted for the hold-to-talk key change."
+                elif preview_key_changed:
+                    body += " Preview key changes apply on the next preview."
+                notify("Voxpress settings saved", body)
+            break
+        dialog.destroy()
+        self.settings_dialog = None
+
+    def quit(self, *_args):
+        Gtk.main_quit()
+
+
+def run_indicator():
+    VoxtypeIndicator()
+    Gtk.main()
+    return 0
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("command", nargs="?", choices=["run", "status", "check"], default="run")
+    args = parser.parse_args()
+
+    if args.command == "status":
+        print("active" if service_active() else "inactive")
+        return 0
+    if args.command == "check":
+        settings = load_settings()
+        print(json.dumps(settings, ensure_ascii=False, sort_keys=True))
+        return 0
+    return run_indicator()
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+STATE_DIR="${XDG_RUNTIME_DIR:-/tmp}/voxtype"
+SAVED_CLIPBOARD="$STATE_DIR/saved_clipboard"
+SAVED_STATE="$STATE_DIR/saved_clipboard_state"
+
+mkdir -p "$STATE_DIR"
+
+if /usr/bin/xclip -selection clipboard -o >"$SAVED_CLIPBOARD" 2>/dev/null; then
+  printf 'present\n' >"$SAVED_STATE"
+else
+  : >"$SAVED_CLIPBOARD"
+  printf 'absent\n' >"$SAVED_STATE"
+fi

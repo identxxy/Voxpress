@@ -1,0 +1,98 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Give xclip a short moment to become the clipboard owner before pasting.
+sleep "${VOXTYPE_PASTE_DELAY:-0.12}"
+
+STATE_DIR="${XDG_RUNTIME_DIR:-/tmp}/voxtype"
+EXPECTED_PASTE="$STATE_DIR/expected_paste_text"
+SAVED_CLIPBOARD="$STATE_DIR/saved_clipboard"
+SAVED_STATE="$STATE_DIR/saved_clipboard_state"
+CLIPBOARD_NOW="$(mktemp)"
+EXPECTED_TRIMMED="$(mktemp)"
+
+cleanup() {
+  rm -f "$CLIPBOARD_NOW" "$EXPECTED_TRIMMED"
+}
+trap cleanup EXIT
+
+restore_clipboard() {
+  if [[ ! -f "$SAVED_STATE" ]]; then
+    return
+  fi
+
+  case "$(cat "$SAVED_STATE" 2>/dev/null || true)" in
+    present)
+      /usr/bin/xclip -selection clipboard -i "$SAVED_CLIPBOARD" >/dev/null 2>&1 &
+      ;;
+    absent)
+      { printf '' | /usr/bin/xclip -selection clipboard -i >/dev/null 2>&1; } &
+      ;;
+  esac
+}
+
+if [[ ! -f "$EXPECTED_PASTE" ]]; then
+  exit 0
+fi
+
+NOW="$(date +%s)"
+EXPECTED_MTIME="$(stat -c %Y "$EXPECTED_PASTE" 2>/dev/null || printf '0')"
+EXPECTED_MAX_AGE="${VOXTYPE_EXPECTED_PASTE_MAX_AGE:-20}"
+if (( NOW - EXPECTED_MTIME > EXPECTED_MAX_AGE )); then
+  rm -f "$EXPECTED_PASTE"
+  restore_clipboard
+  exit 0
+fi
+
+if ! /usr/bin/xclip -selection clipboard -o >"$CLIPBOARD_NOW" 2>/dev/null; then
+  restore_clipboard
+  exit 0
+fi
+
+MATCH_MODE=exact
+if ! cmp -s "$EXPECTED_PASTE" "$CLIPBOARD_NOW"; then
+  /usr/bin/python3 - "$EXPECTED_PASTE" "$EXPECTED_TRIMMED" <<'PY'
+import pathlib
+import sys
+
+source = pathlib.Path(sys.argv[1])
+target = pathlib.Path(sys.argv[2])
+target.write_bytes(source.read_bytes().rstrip(b"\n"))
+PY
+  if cmp -s "$EXPECTED_TRIMMED" "$CLIPBOARD_NOW"; then
+    MATCH_MODE=restore-trailing-newline
+  else
+    restore_clipboard
+    exit 0
+  fi
+fi
+
+XDOTOOL="${VOXTYPE_XDOTOOL:-${VOXPRESS_XDOTOOL:-xdotool}}"
+WINDOW_CLASS="$("$XDOTOOL" getactivewindow getwindowclassname 2>/dev/null || true)"
+
+case "${WINDOW_CLASS,,}" in
+  kitty|gnome-terminal|org.gnome.terminal|alacritty|wezterm|konsole|xterm)
+    PASTE_KEYS="${VOXTYPE_TERMINAL_PASTE_KEYS:-ctrl+shift+v}"
+    ;;
+  *)
+    PASTE_KEYS="${VOXTYPE_PASTE_KEYS:-shift+Insert}"
+    ;;
+esac
+
+if [[ "${VOXTYPE_PASTE_DRY_RUN:-0}" == "1" ]]; then
+  printf 'paste_keys=%s window_class=%s match_mode=%s\n' "$PASTE_KEYS" "$WINDOW_CLASS" "$MATCH_MODE"
+  rm -f "$EXPECTED_PASTE"
+  restore_clipboard
+  exit 0
+fi
+
+if [[ "$MATCH_MODE" == "restore-trailing-newline" ]]; then
+  /usr/bin/xclip -selection clipboard -i "$EXPECTED_PASTE" >/dev/null 2>&1 &
+  sleep "${VOXTYPE_REPAIR_CLIPBOARD_DELAY:-0.08}"
+fi
+
+rm -f "$EXPECTED_PASTE"
+
+"$XDOTOOL" key --clearmodifiers "$PASTE_KEYS"
+sleep "${VOXTYPE_RESTORE_CLIPBOARD_DELAY:-0.45}"
+restore_clipboard

@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+systemctl --user enable --now voxpress-pause-listener.service >/dev/null
+/usr/bin/notify-send -a Voxpress "Voxpress enabled" "Hold the configured key to dictate."

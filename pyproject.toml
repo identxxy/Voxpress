@@ -1,0 +1,13 @@
+[project]
+name = "voxpress"
+version = "0.1.0"
+description = "Linux desktop companion layer for local Voxtype speech-to-text input."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { file = "LICENSE" }
+dependencies = [
+  "opencc-python-reimplemented",
+]
+
+[tool.ruff]
+line-length = 100

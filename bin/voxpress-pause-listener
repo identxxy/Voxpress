@@ -1,0 +1,358 @@
+#!/usr/bin/python3
+import json
+import os
+import re
+import signal
+import subprocess
+import sys
+import time
+
+
+CONFIG_PATH = os.environ.get(
+    "VOXTYPE_POPUP_SETTINGS",
+    os.environ.get("VOXPRESS_SETTINGS", os.path.expanduser("~/.config/voxpress/settings.json")),
+)
+DEFAULT_TRIGGER_KEY = os.environ.get("VOXTYPE_TRIGGER_KEY", "Pause")
+KEYCODE_OVERRIDE = os.environ.get("VOXTYPE_PAUSE_KEYCODE")
+VOXTYPE = os.environ.get("VOXTYPE_BIN", "voxtype")
+XDOTOOL = os.environ.get(
+    "VOXTYPE_XDOTOOL", os.environ.get("VOXPRESS_XDOTOOL", "xdotool")
+)
+POPUP_UI = os.environ.get(
+    "VOXTYPE_POPUP_UI", os.path.expanduser("~/.local/bin/voxpress-popup-ui")
+)
+RUNTIME_DIR = os.environ.get("XDG_RUNTIME_DIR", f"/tmp/voxtype-{os.getuid()}")
+STATE_DIR = os.path.join(RUNTIME_DIR, "voxtype")
+TARGET_WINDOW_FILE = os.path.join(STATE_DIR, "target_window")
+EXPECTED_PASTE_FILE = os.path.join(STATE_DIR, "expected_paste_text")
+DRY_RUN = os.environ.get("VOXTYPE_PAUSE_DRY_RUN", "0") == "1"
+MIN_RECORDING_MS = int(os.environ.get("VOXTYPE_MIN_RECORDING_MS", "650"))
+
+recording = False
+target_window = None
+recording_started_at = 0.0
+trigger_key = DEFAULT_TRIGGER_KEY
+trigger_keycodes = {KEYCODE_OVERRIDE} if KEYCODE_OVERRIDE else set()
+settings_mtime = None
+
+KEY_NAMES = {
+    "Pause",
+    "Scroll_Lock",
+    "Return",
+    "Escape",
+    "Delete",
+    "BackSpace",
+    "Insert",
+    "F9",
+    "F10",
+    "F11",
+    "F12",
+    "XF86AudioMicMute",
+    "XF86AudioRecord",
+    "XF86AudioPlay",
+}
+
+KEY_ALIASES = {
+    "Enter": "Return",
+    "Scroll Lock": "Scroll_Lock",
+    "Backspace": "BackSpace",
+}
+
+KEY_LABELS = {
+    "Pause": "Pause",
+    "Scroll_Lock": "Scroll Lock",
+    "Return": "Enter",
+    "Escape": "Escape",
+    "Delete": "Delete",
+    "BackSpace": "Backspace",
+    "Insert": "Insert",
+    "F9": "F9",
+    "F10": "F10",
+    "F11": "F11",
+    "F12": "F12",
+    "XF86AudioMicMute": "Mic mute",
+    "XF86AudioRecord": "Audio Record",
+    "XF86AudioPlay": "Audio Play/Pause",
+}
+
+
+def log(message: str) -> None:
+    print(message, flush=True)
+
+
+def normalize_key_name(value: str | None, default: str = DEFAULT_TRIGGER_KEY) -> str:
+    value = str(value or default)
+    value = KEY_ALIASES.get(value, value)
+    return value if value in KEY_NAMES else default
+
+
+def key_label(key_name: str) -> str:
+    return KEY_LABELS.get(key_name, key_name.replace("_", " "))
+
+
+def load_trigger_key() -> str:
+    env_key = os.environ.get("VOXTYPE_TRIGGER_KEY")
+    if env_key:
+        return normalize_key_name(env_key)
+
+    try:
+        with open(CONFIG_PATH, "r", encoding="utf-8") as handle:
+            settings = json.load(handle)
+    except (OSError, json.JSONDecodeError):
+        return DEFAULT_TRIGGER_KEY
+    return normalize_key_name(settings.get("trigger_key"), DEFAULT_TRIGGER_KEY)
+
+
+def keycodes_for_key_name(key_name: str) -> set[str]:
+    if KEYCODE_OVERRIDE:
+        return {KEYCODE_OVERRIDE}
+
+    try:
+        result = subprocess.run(
+            ["/usr/bin/xmodmap", "-pke"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            timeout=1,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        result = None
+
+    keycodes = set()
+    if result:
+        for line in result.stdout.splitlines():
+            match = re.match(r"keycode\s+(\d+)\s+=\s+(.*)", line)
+            if not match:
+                continue
+            keycode, symbols = match.groups()
+            if key_name in symbols.split():
+                keycodes.add(keycode)
+
+    if not keycodes and key_name == "Pause":
+        keycodes.add("127")
+    return keycodes
+
+
+def refresh_trigger_keycodes(force: bool = False) -> set[str]:
+    global trigger_key, trigger_keycodes, settings_mtime
+    if KEYCODE_OVERRIDE:
+        return trigger_keycodes
+
+    try:
+        mtime = os.path.getmtime(CONFIG_PATH)
+    except OSError:
+        mtime = None
+
+    if not force and mtime == settings_mtime and trigger_keycodes:
+        return trigger_keycodes
+
+    next_key = load_trigger_key()
+    next_keycodes = keycodes_for_key_name(next_key)
+    if not next_keycodes:
+        log(f"Could not resolve key {next_key}; falling back to Pause")
+        next_key = "Pause"
+        next_keycodes = keycodes_for_key_name(next_key)
+
+    if force or next_key != trigger_key or next_keycodes != trigger_keycodes:
+        log(f"Listening for {key_label(next_key)} keycodes: {', '.join(sorted(next_keycodes))}")
+    trigger_key = next_key
+    trigger_keycodes = next_keycodes
+    settings_mtime = mtime
+    return trigger_keycodes
+
+
+def run_voxtype(action: str) -> None:
+    cmd = [VOXTYPE, "record", action]
+    if DRY_RUN:
+        log(f"dry-run: {' '.join(cmd)}")
+        return
+
+    try:
+        subprocess.run(
+            cmd,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=5,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        log(f"voxtype record {action} failed: {exc}")
+
+
+def voxtype_status() -> str | None:
+    if DRY_RUN:
+        return "idle"
+    try:
+        result = subprocess.run(
+            [VOXTYPE, "status"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            timeout=2,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    return result.stdout.strip() or None
+
+
+def clear_expected_paste() -> None:
+    try:
+        os.unlink(EXPECTED_PASTE_FILE)
+    except FileNotFoundError:
+        pass
+    except OSError:
+        pass
+
+
+def get_active_window() -> str | None:
+    try:
+        result = subprocess.run(
+            [XDOTOOL, "getactivewindow"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            timeout=1,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+
+    window = result.stdout.strip()
+    return window or None
+
+
+def save_target_window(window: str | None) -> None:
+    if not window:
+        return
+    try:
+        os.makedirs(STATE_DIR, exist_ok=True)
+        with open(TARGET_WINDOW_FILE, "w", encoding="utf-8") as handle:
+            handle.write(window)
+    except OSError:
+        pass
+
+
+def popup(command: str, window: str | None = None) -> None:
+    if DRY_RUN:
+        log(f"dry-run: {POPUP_UI} {command}")
+        return
+    cmd = [POPUP_UI, command]
+    if window:
+        cmd.extend(["--reference-window", window])
+
+    try:
+        subprocess.run(
+            cmd,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=5,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        log(f"popup {command} failed: {exc}")
+
+
+def start_recording() -> None:
+    global recording, target_window, recording_started_at
+    if recording:
+        return
+    status = voxtype_status()
+    if status not in (None, "idle"):
+        log(f"Pause pressed: ignored while voxtype status is {status}")
+        return
+
+    recording = True
+    recording_started_at = time.monotonic()
+    target_window = get_active_window()
+    save_target_window(target_window)
+    clear_expected_paste()
+    log(f"{key_label(trigger_key)} pressed: start recording")
+    popup("recording", target_window)
+    run_voxtype("start")
+
+
+def stop_recording() -> None:
+    global recording, recording_started_at
+    if not recording:
+        return
+    recording = False
+    duration_ms = int((time.monotonic() - recording_started_at) * 1000)
+    if duration_ms < MIN_RECORDING_MS:
+        log(f"{key_label(trigger_key)} released after {duration_ms}ms: cancel short recording")
+        popup("hide", target_window)
+        clear_expected_paste()
+        run_voxtype("cancel")
+        return
+
+    log(f"{key_label(trigger_key)} released: stop recording")
+    popup("transcribing", target_window)
+    run_voxtype("stop")
+
+
+def cancel_recording() -> None:
+    global recording
+    popup("hide", target_window)
+    clear_expected_paste()
+    if recording:
+        recording = False
+        run_voxtype("cancel")
+
+
+def handle_signal(signum, frame) -> None:
+    cancel_recording()
+    raise SystemExit(0)
+
+
+def event_stream():
+    cmd = ["/usr/bin/stdbuf", "-oL", "/usr/bin/xinput", "test-xi2", "--root"]
+    while True:
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+        )
+        try:
+            yield from proc.stdout
+        finally:
+            proc.terminate()
+            try:
+                proc.wait(timeout=1)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+
+        log("xinput stream ended; restarting in 1s")
+        time.sleep(1)
+
+
+def main() -> int:
+    signal.signal(signal.SIGINT, handle_signal)
+    signal.signal(signal.SIGTERM, handle_signal)
+
+    refresh_trigger_keycodes(force=True)
+    pending_event = None
+    for line in event_stream():
+        stripped = line.strip()
+        if stripped.startswith("EVENT type 2 (KeyPress)"):
+            pending_event = "press"
+            continue
+        if stripped.startswith("EVENT type 3 (KeyRelease)"):
+            pending_event = "release"
+            continue
+        if pending_event and stripped.startswith("detail:"):
+            detail = stripped.split(":", 1)[1].strip().split()[0]
+            if detail in refresh_trigger_keycodes():
+                if pending_event == "press":
+                    start_recording()
+                else:
+                    stop_recording()
+            pending_event = None
+
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

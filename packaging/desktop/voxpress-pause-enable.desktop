@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Voxpress Enable
+Comment=Enable Voxpress hold-to-talk dictation
+Exec=voxpress-pause-enable
+Icon=audio-input-microphone
+Terminal=false
+Categories=Utility;Accessibility;

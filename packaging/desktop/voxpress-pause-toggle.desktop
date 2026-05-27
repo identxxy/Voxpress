@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Voxpress Toggle
+Comment=Toggle Voxpress hold-to-talk dictation
+Exec=voxpress-pause-toggle
+Icon=audio-input-microphone
+Terminal=false
+Categories=Utility;Accessibility;

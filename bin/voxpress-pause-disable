@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+voxpress-popup-ui hide >/dev/null 2>&1 || true
+voxtype record cancel >/dev/null 2>&1 || true
+systemctl --user disable --now voxpress-pause-listener.service >/dev/null
+/usr/bin/notify-send -a Voxpress "Voxpress disabled" "The configured key will no longer trigger dictation."

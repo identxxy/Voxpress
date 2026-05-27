@@ -1,0 +1,900 @@
+#!/usr/bin/python3
+import argparse
+import fcntl
+import json
+import os
+import re
+import socket
+import subprocess
+import sys
+import threading
+import time
+
+import cairo
+import gi
+
+gi.require_version("Gtk", "3.0")
+gi.require_version("Gdk", "3.0")
+gi.require_version("GdkX11", "3.0")
+from gi.repository import Gdk, GdkX11, GLib, Gtk
+
+
+RUNTIME_DIR = os.environ.get("XDG_RUNTIME_DIR", f"/tmp/voxtype-{os.getuid()}")
+STATE_DIR = os.path.join(RUNTIME_DIR, "voxtype")
+SOCKET_PATH = os.path.join(STATE_DIR, "popup-ui.sock")
+LOCK_PATH = os.path.join(STATE_DIR, "popup-ui-start.lock")
+XDOTOOL = os.environ.get(
+    "VOXTYPE_XDOTOOL", os.environ.get("VOXPRESS_XDOTOOL", "xdotool")
+)
+STATUS_WIDTH = int(os.environ.get("VOXTYPE_STATUS_WIDTH", "440"))
+STATUS_HEIGHT = int(os.environ.get("VOXTYPE_STATUS_HEIGHT", "82"))
+PREVIEW_WIDTH = int(os.environ.get("VOXTYPE_PREVIEW_WIDTH", "720"))
+PREVIEW_HEIGHT = int(os.environ.get("VOXTYPE_PREVIEW_HEIGHT", "240"))
+CONFIG_PATH = os.environ.get(
+    "VOXTYPE_POPUP_SETTINGS",
+    os.environ.get("VOXPRESS_SETTINGS", os.path.expanduser("~/.config/voxpress/settings.json")),
+)
+
+DEFAULT_SETTINGS = {
+    "window_opacity": float(os.environ.get("VOXTYPE_POPUP_OPACITY", "1.0")),
+    "panel_alpha": float(os.environ.get("VOXTYPE_POPUP_PANEL_ALPHA", "0.86")),
+    "text_bg_alpha": float(os.environ.get("VOXTYPE_POPUP_TEXT_BG_ALPHA", "0.90")),
+    "button_alpha": float(os.environ.get("VOXTYPE_POPUP_BUTTON_ALPHA", "0.88")),
+    "label_font_size": int(os.environ.get("VOXTYPE_POPUP_LABEL_FONT_SIZE", "16")),
+    "title_font_size": int(os.environ.get("VOXTYPE_POPUP_TITLE_FONT_SIZE", "19")),
+    "text_font_size": int(os.environ.get("VOXTYPE_POPUP_TEXT_FONT_SIZE", "18")),
+    "border_radius": int(os.environ.get("VOXTYPE_POPUP_BORDER_RADIUS", "9")),
+    "status_width": int(os.environ.get("VOXTYPE_STATUS_WIDTH", "240")),
+    "status_height": int(os.environ.get("VOXTYPE_STATUS_HEIGHT", "52")),
+    "preview_width": PREVIEW_WIDTH,
+    "preview_height": PREVIEW_HEIGHT,
+    "horizontal_fraction": float(os.environ.get("VOXTYPE_POPUP_HORIZONTAL_FRACTION", "0.50")),
+    "vertical_fraction": float(os.environ.get("VOXTYPE_POPUP_VERTICAL_FRACTION", "0.75")),
+    "trigger_key": os.environ.get("VOXTYPE_TRIGGER_KEY", "Pause"),
+    "confirm_key": os.environ.get("VOXTYPE_CONFIRM_KEY", "Return"),
+    "cancel_key": os.environ.get("VOXTYPE_CANCEL_KEY", "Scroll_Lock"),
+}
+
+SETTING_LIMITS = {
+    "window_opacity": (0.72, 1.0),
+    "panel_alpha": (0.45, 1.0),
+    "text_bg_alpha": (0.45, 1.0),
+    "button_alpha": (0.45, 1.0),
+    "label_font_size": (12, 28),
+    "title_font_size": (13, 32),
+    "text_font_size": (12, 32),
+    "border_radius": (0, 24),
+    "status_width": (180, 1000),
+    "status_height": (42, 240),
+    "preview_width": (420, 1400),
+    "preview_height": (160, 900),
+    "horizontal_fraction": (0.05, 0.95),
+    "vertical_fraction": (0.20, 0.90),
+}
+
+KEY_LABELS = {
+    "Pause": "Pause",
+    "Scroll_Lock": "Scroll Lock",
+    "Return": "Enter",
+    "Escape": "Escape",
+    "Delete": "Delete",
+    "BackSpace": "Backspace",
+    "Insert": "Insert",
+    "F9": "F9",
+    "F10": "F10",
+    "F11": "F11",
+    "F12": "F12",
+    "XF86AudioMicMute": "Mic mute",
+    "XF86AudioRecord": "Audio Record",
+    "XF86AudioPlay": "Audio Play/Pause",
+}
+
+KEY_ALIASES = {
+    "Enter": "Return",
+    "Scroll Lock": "Scroll_Lock",
+    "Backspace": "BackSpace",
+}
+
+KEY_SETTINGS = {"trigger_key", "confirm_key", "cancel_key"}
+
+
+def clamp(value, low, high):
+    return min(max(value, low), high)
+
+
+def normalize_key_name(value, default):
+    value = str(value or default)
+    value = KEY_ALIASES.get(value, value)
+    return value if value in KEY_LABELS else default
+
+
+def load_settings():
+    settings = dict(DEFAULT_SETTINGS)
+    try:
+        with open(CONFIG_PATH, "r", encoding="utf-8") as handle:
+            raw = json.load(handle)
+    except (OSError, json.JSONDecodeError):
+        raw = {}
+
+    if isinstance(raw, dict):
+        settings.update({key: raw[key] for key in settings.keys() & raw.keys()})
+
+    normalized = {}
+    for key, default in DEFAULT_SETTINGS.items():
+        if key in KEY_SETTINGS:
+            normalized[key] = normalize_key_name(settings.get(key, default), default)
+            continue
+        low, high = SETTING_LIMITS[key]
+        try:
+            value = float(settings.get(key, default))
+        except (TypeError, ValueError):
+            value = float(default)
+        value = clamp(value, low, high)
+        if isinstance(default, int):
+            value = int(round(value))
+        normalized[key] = value
+    return normalized
+
+
+def run(cmd, timeout=1):
+    return subprocess.run(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        text=True,
+        timeout=timeout,
+        check=False,
+    )
+
+
+def normalize_window_id(window):
+    if not window:
+        return None
+    try:
+        return str(int(str(window), 0))
+    except ValueError:
+        return str(window)
+
+
+def window_geometry(window):
+    window = normalize_window_id(window)
+    if not window:
+        return None
+    try:
+        result = run(["/usr/bin/xwininfo", "-id", window])
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+
+    fields = {}
+    for line in result.stdout.splitlines():
+        if ":" not in line:
+            continue
+        key, value = line.split(":", 1)
+        fields[key.strip()] = value.strip()
+
+    try:
+        return {
+            "x": int(fields["Absolute upper-left X"]),
+            "y": int(fields["Absolute upper-left Y"]),
+            "width": int(fields["Width"]),
+            "height": int(fields["Height"]),
+        }
+    except (KeyError, ValueError):
+        return None
+
+
+def root_geometry():
+    try:
+        result = run(["/usr/bin/xwininfo", "-root"])
+    except (OSError, subprocess.TimeoutExpired):
+        return {"x": 0, "y": 0, "width": 1920, "height": 1080, "primary": True}
+
+    width = height = None
+    for line in result.stdout.splitlines():
+        if "Width:" in line:
+            width = int(line.split(":", 1)[1].strip())
+        if "Height:" in line:
+            height = int(line.split(":", 1)[1].strip())
+    return {
+        "x": 0,
+        "y": 0,
+        "width": width or 1920,
+        "height": height or 1080,
+        "primary": True,
+    }
+
+
+def monitors():
+    try:
+        result = run(["/usr/bin/xrandr", "--listactivemonitors"])
+    except (OSError, subprocess.TimeoutExpired):
+        return [root_geometry()]
+
+    parsed = []
+    for line in result.stdout.splitlines():
+        match = re.search(r"([+*]*)(\d+)/\d+x(\d+)/\d+\+(-?\d+)\+(-?\d+)", line)
+        if match:
+            flags, width, height, x, y = match.groups()
+            parsed.append(
+                {
+                    "x": int(x),
+                    "y": int(y),
+                    "width": int(width),
+                    "height": int(height),
+                    "primary": "*" in flags,
+                }
+            )
+    return parsed or [root_geometry()]
+
+
+def choose_monitor(reference_window):
+    reference = window_geometry(reference_window)
+    available = monitors()
+    if not reference:
+        return next((monitor for monitor in available if monitor["primary"]), available[0])
+
+    center_x = reference["x"] + reference["width"] / 2
+    center_y = reference["y"] + reference["height"] / 2
+    for monitor in available:
+        if (
+            monitor["x"] <= center_x < monitor["x"] + monitor["width"]
+            and monitor["y"] <= center_y < monitor["y"] + monitor["height"]
+        ):
+            return monitor
+    return next((monitor for monitor in available if monitor["primary"]), available[0])
+
+
+def socket_request(message, wait_response=True, stdin_text=None):
+    ensure_daemon()
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+        client.connect(SOCKET_PATH)
+        if stdin_text is not None:
+            message["text"] = stdin_text
+        client.sendall((json.dumps(message) + "\n").encode("utf-8"))
+        if not wait_response:
+            return {}
+        with client.makefile("r", encoding="utf-8") as stream:
+            line = stream.readline()
+            return json.loads(line) if line else {}
+
+
+def ensure_daemon():
+    os.makedirs(STATE_DIR, exist_ok=True)
+
+    def can_connect():
+        try:
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+                client.settimeout(0.2)
+                client.connect(SOCKET_PATH)
+                return True
+        except OSError:
+            return False
+
+    if can_connect():
+        return
+
+    with open(LOCK_PATH, "w", encoding="utf-8") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        if not can_connect():
+            subprocess.Popen(
+                [sys.argv[0], "daemon"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=True,
+            )
+        deadline = time.monotonic() + 3
+        while time.monotonic() < deadline:
+            if can_connect():
+                return
+            time.sleep(0.05)
+
+
+def apply_rgba_visual(window):
+    screen = window.get_screen()
+    visual = screen.get_rgba_visual()
+    if visual is not None and screen.is_composited():
+        window.set_visual(visual)
+
+
+def build_css(settings):
+    return f"""
+        window {{
+            background: transparent;
+            color: #eef2f7;
+        }}
+        .popup-panel {{
+            background-color: rgba(18, 21, 26, {settings['panel_alpha']:.3f});
+            color: #eef2f7;
+            border: 1px solid rgba(148, 163, 184, 0.35);
+            border-radius: {settings['border_radius']}px;
+        }}
+        label {{
+            color: #dbe4ef;
+            font-size: {settings['label_font_size']}px;
+        }}
+        label.title {{
+            font-weight: 700;
+            font-size: {settings['title_font_size'] + 2}px;
+            color: #f8fafc;
+        }}
+        label.status-title {{
+            font-weight: 700;
+            font-size: {settings['title_font_size']}px;
+            color: #f8fafc;
+        }}
+        scrolledwindow {{
+            border: 1px solid rgba(148, 163, 184, 0.28);
+            border-radius: 6px;
+        }}
+        textview, textview text {{
+            background: rgba(30, 35, 43, {settings['text_bg_alpha']:.3f});
+            color: #f3f6fb;
+            font-size: {settings['text_font_size']}px;
+            caret-color: #93c5fd;
+        }}
+        button {{
+            background: rgba(51, 65, 85, {settings['button_alpha']:.3f});
+            color: #f8fafc;
+            border: 1px solid rgba(148, 163, 184, 0.32);
+            border-radius: 5px;
+            padding: 4px 12px;
+            min-height: 24px;
+        }}
+        button:hover {{
+            background: rgba(71, 85, 105, 0.88);
+        }}
+        """
+
+
+def panel_padding(settings, status_mode=False):
+    radius = settings["border_radius"]
+    if status_mode:
+        return max(10, min(13, 8 + radius // 6))
+    return max(16, min(32, 16 + radius // 2))
+
+
+def content_margin(settings):
+    return max(12, min(28, 14 + settings["border_radius"] // 3))
+
+
+def button_bottom_margin(settings):
+    return max(8, min(18, 8 + settings["border_radius"] // 4))
+
+
+def preview_title_margin_top(settings):
+    return max(6, min(14, 6 + settings["border_radius"] // 4))
+
+
+def preview_title_margin_bottom(settings):
+    return max(4, min(10, 4 + settings["border_radius"] // 6))
+
+
+def preview_status_margin_bottom(settings):
+    return max(6, min(14, 6 + settings["border_radius"] // 4))
+
+
+def target_position(settings, reference_window, width, height):
+    monitor = choose_monitor(reference_window)
+    horizontal_fraction = settings["horizontal_fraction"]
+    vertical_fraction = settings["vertical_fraction"]
+    target_x = monitor["x"] + int(monitor["width"] * horizontal_fraction) - width // 2
+    target_y = monitor["y"] + int(monitor["height"] * vertical_fraction) - height // 2
+    return target_x, target_y
+
+
+def set_pointer_passthrough(window):
+    try:
+        window.input_shape_combine_region(cairo.Region())
+    except Exception:
+        pass
+
+
+def keyvals_for_key_name(key_name):
+    if key_name == "Return":
+        return {Gdk.KEY_Return, Gdk.KEY_KP_Enter, Gdk.KEY_ISO_Enter}
+    if key_name == "Delete":
+        return {Gdk.KEY_Delete, Gdk.KEY_KP_Delete}
+    if key_name == "Insert":
+        return {Gdk.KEY_Insert, Gdk.KEY_KP_Insert}
+
+    keyval = Gdk.keyval_from_name(key_name)
+    return {keyval} if keyval else set()
+
+
+def key_label(key_name):
+    return KEY_LABELS.get(key_name, key_name.replace("_", " "))
+
+
+class StatusWindow:
+    def __init__(self):
+        self.reference_window = None
+        self.settings = load_settings()
+        self.visible_opacity = self.settings["window_opacity"]
+        self.reveal_token = 0
+        window_type = (
+            Gtk.WindowType.TOPLEVEL
+            if os.environ.get("VOXTYPE_STATUS_WINDOW_TYPE") == "toplevel"
+            else Gtk.WindowType.POPUP
+        )
+        self.window = Gtk.Window(type=window_type, title="Voxpress status")
+        self.window.set_keep_above(True)
+        self.window.set_skip_taskbar_hint(True)
+        self.window.set_skip_pager_hint(True)
+        self.window.set_decorated(False)
+        self.window.set_accept_focus(False)
+        self.window.set_focus_on_map(False)
+        self.window.set_border_width(0)
+        self.window.set_app_paintable(True)
+        if window_type == Gtk.WindowType.TOPLEVEL:
+            self.window.set_type_hint(Gdk.WindowTypeHint.NOTIFICATION)
+        apply_rgba_visual(self.window)
+        self.window.connect("realize", self.on_realize)
+        self.window.connect("configure-event", self.on_configure)
+
+        self.css = Gtk.CssProvider()
+        Gtk.StyleContext.add_provider_for_screen(
+            self.window.get_screen(), self.css, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION
+        )
+
+        self.outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+        self.outer.get_style_context().add_class("popup-panel")
+        self.outer.get_style_context().add_class("status-panel")
+        self.outer.set_halign(Gtk.Align.FILL)
+        self.outer.set_valign(Gtk.Align.FILL)
+        self.window.add(self.outer)
+
+        self.label = Gtk.Label()
+        self.label.set_use_markup(True)
+        self.label.set_xalign(0.5)
+        self.label.set_justify(Gtk.Justification.CENTER)
+        self.label.set_halign(Gtk.Align.FILL)
+        self.label.set_valign(Gtk.Align.CENTER)
+        self.label.set_hexpand(True)
+        self.label.set_vexpand(True)
+        self.label.get_style_context().add_class("status-title")
+        self.outer.pack_start(self.label, True, True, 0)
+
+        self.apply_settings()
+        self.map_hidden()
+
+    def on_realize(self, *_args):
+        set_pointer_passthrough(self.window)
+        return False
+
+    def on_configure(self, *_args):
+        set_pointer_passthrough(self.window)
+        return False
+
+    def reload_settings(self):
+        self.settings = load_settings()
+        self.apply_settings()
+
+    def apply_settings(self):
+        self.visible_opacity = self.settings["window_opacity"]
+        self.css.load_from_data(build_css(self.settings).encode("utf-8"))
+        self.outer.set_border_width(panel_padding(self.settings, status_mode=True))
+
+    def set_geometry(self, reference_window=None):
+        width = self.settings["status_width"]
+        height = self.settings["status_height"]
+        padding = panel_padding(self.settings, status_mode=True)
+        self.window.set_default_size(width, height)
+        self.window.set_size_request(width, height)
+        self.window.resize(width, height)
+        self.label.set_size_request(max(80, width - 2 * padding), -1)
+        x, y = target_position(self.settings, reference_window, width, height)
+        self.window.move(x, y)
+
+    def map_hidden(self):
+        self.window.set_opacity(0.0)
+        self.set_geometry(self.reference_window)
+        self.outer.show_all()
+        self.window.show_all()
+        set_pointer_passthrough(self.window)
+
+    def show(self, title, reference_window=None):
+        self.reload_settings()
+        self.reference_window = reference_window or self.reference_window
+        self.reveal_token += 1
+        token = self.reveal_token
+        dot_color = "#f87171" if title.lower().startswith("recording") else "#38bdf8"
+        self.label.set_markup(
+            f'<span foreground="{dot_color}">●</span> {GLib.markup_escape_text(title)}'
+        )
+        self.window.set_accept_focus(False)
+        self.window.set_focus_on_map(False)
+        self.window.set_opacity(0.0)
+        self.set_geometry(self.reference_window)
+        if not self.window.get_visible():
+            self.window.show_all()
+        self.window.present()
+        set_pointer_passthrough(self.window)
+        GLib.idle_add(self.reposition_hidden, token)
+        GLib.timeout_add(35, self.reposition_hidden, token)
+        GLib.timeout_add(70, self.reveal, token)
+        return False
+
+    def reposition_hidden(self, token):
+        if token == self.reveal_token:
+            self.set_geometry(self.reference_window)
+        return False
+
+    def reveal(self, token):
+        if token == self.reveal_token:
+            self.set_geometry(self.reference_window)
+            self.window.set_opacity(self.visible_opacity)
+            set_pointer_passthrough(self.window)
+        return False
+
+    def hide(self):
+        self.reveal_token += 1
+        self.window.set_accept_focus(False)
+        self.window.set_focus_on_map(False)
+        self.window.set_opacity(0.0)
+        set_pointer_passthrough(self.window)
+        return False
+
+
+class PreviewWindow:
+    def __init__(self):
+        self.pending_conn = None
+        self.reference_window = None
+        self.settings = load_settings()
+        self.visible_opacity = self.settings["window_opacity"]
+
+        self.window = Gtk.Window(type=Gtk.WindowType.TOPLEVEL, title="Voxpress preview")
+        self.window.set_keep_above(True)
+        self.window.set_skip_taskbar_hint(True)
+        self.window.set_skip_pager_hint(True)
+        self.window.set_decorated(False)
+        self.window.set_accept_focus(True)
+        self.window.set_focus_on_map(True)
+        self.window.set_border_width(0)
+        self.window.set_app_paintable(True)
+        apply_rgba_visual(self.window)
+        self.window.connect("delete-event", self.on_delete)
+        self.window.connect("key-press-event", self.on_key_press)
+
+        self.css = Gtk.CssProvider()
+        Gtk.StyleContext.add_provider_for_screen(
+            self.window.get_screen(), self.css, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION
+        )
+
+        self.outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        self.outer.get_style_context().add_class("popup-panel")
+        self.window.add(self.outer)
+
+        self.title = Gtk.Label()
+        self.title.set_xalign(0.5)
+        self.title.set_justify(Gtk.Justification.CENTER)
+        self.title.set_use_markup(True)
+        self.title.set_ellipsize(3)
+        self.title.set_halign(Gtk.Align.CENTER)
+        self.title.get_style_context().add_class("title")
+        self.outer.pack_start(self.title, False, False, 0)
+
+        self.status = Gtk.Label()
+        self.status.set_xalign(0.5)
+        self.status.set_justify(Gtk.Justification.CENTER)
+        self.status.set_ellipsize(3)
+        self.status.set_halign(Gtk.Align.CENTER)
+        self.outer.pack_start(self.status, False, False, 0)
+
+        self.scroller = Gtk.ScrolledWindow()
+        self.scroller.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
+        self.scroller.set_margin_start(10)
+        self.scroller.set_margin_end(10)
+        self.textview = Gtk.TextView()
+        self.textview.set_wrap_mode(Gtk.WrapMode.WORD_CHAR)
+        self.textview.set_accepts_tab(False)
+        self.textview.set_left_margin(12)
+        self.textview.set_right_margin(12)
+        self.textview.set_top_margin(10)
+        self.textview.set_bottom_margin(10)
+        self.textview.connect("key-press-event", self.on_key_press)
+        self.scroller.add(self.textview)
+        self.outer.pack_start(self.scroller, True, True, 0)
+
+        self.buttons = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=18)
+        self.buttons.set_halign(Gtk.Align.CENTER)
+        self.buttons.set_margin_start(10)
+        self.buttons.set_margin_end(10)
+        self.cancel_button = Gtk.Button(label="Cancel")
+        self.insert_button = Gtk.Button(label="Enter")
+        self.cancel_button.set_can_focus(False)
+        self.insert_button.set_can_focus(False)
+        self.insert_button.set_can_default(True)
+        self.cancel_button.set_tooltip_text("Cancel preview")
+        self.insert_button.set_tooltip_text("Insert preview")
+        self.cancel_button.set_size_request(104, -1)
+        self.insert_button.set_size_request(104, -1)
+        self.cancel_button.connect("clicked", self.on_cancel)
+        self.insert_button.connect("clicked", self.on_insert)
+        self.buttons.pack_start(self.cancel_button, False, False, 0)
+        self.buttons.pack_start(self.insert_button, False, False, 0)
+        self.outer.pack_start(self.buttons, False, False, 0)
+
+        self.apply_settings()
+        self.window.hide()
+
+    def reload_settings(self):
+        self.settings = load_settings()
+        self.apply_settings()
+
+    def apply_settings(self):
+        self.visible_opacity = self.settings["window_opacity"]
+        self.css.load_from_data(build_css(self.settings).encode("utf-8"))
+        if self.window.get_visible():
+            self.window.set_opacity(self.visible_opacity)
+
+    def on_delete(self, *_args):
+        self.cancel_if_pending()
+        return True
+
+    def on_key_press(self, _widget, event):
+        if not self.pending_conn:
+            return False
+        if event.keyval in keyvals_for_key_name(self.settings["confirm_key"]):
+            self.send_preview_response(self.get_text_buffer())
+            return True
+        if event.keyval in keyvals_for_key_name(self.settings["cancel_key"]):
+            self.send_preview_response("")
+            return True
+        return False
+
+    def set_text_buffer(self, text):
+        buffer = self.textview.get_buffer()
+        buffer.set_text(text)
+        start, end = buffer.get_bounds()
+        buffer.place_cursor(end)
+
+    def get_text_buffer(self):
+        buffer = self.textview.get_buffer()
+        start, end = buffer.get_bounds()
+        return buffer.get_text(start, end, True)
+
+    def show(self, text, conn, reference_window=None):
+        self.reload_settings()
+        if self.pending_conn:
+            self.send_preview_response("")
+        self.pending_conn = conn
+        self.reference_window = reference_window or self.reference_window
+        self.window.set_accept_focus(True)
+        self.window.set_focus_on_map(True)
+        padding = panel_padding(self.settings, status_mode=False)
+        inner_margin = content_margin(self.settings)
+        self.outer.set_border_width(padding)
+        self.scroller.set_margin_start(inner_margin)
+        self.scroller.set_margin_end(inner_margin)
+        self.buttons.set_margin_start(inner_margin)
+        self.buttons.set_margin_end(inner_margin)
+        self.buttons.set_margin_top(4)
+        self.buttons.set_margin_bottom(button_bottom_margin(self.settings))
+        width = self.settings["preview_width"]
+        height = self.settings["preview_height"]
+        content_width = max(240, width - 2 * padding)
+        self.title.set_size_request(content_width, -1)
+        self.title.set_margin_top(preview_title_margin_top(self.settings))
+        self.title.set_margin_bottom(preview_title_margin_bottom(self.settings))
+        self.status.set_size_request(content_width, -1)
+        self.status.set_margin_bottom(preview_status_margin_bottom(self.settings))
+        self.window.set_default(self.insert_button)
+        self.title.set_markup(GLib.markup_escape_text("Voxpress preview"))
+        confirm = key_label(self.settings["confirm_key"])
+        cancel = key_label(self.settings["cancel_key"])
+        self.status.set_text(f"Edit text, then {confirm} to insert or {cancel} to cancel.")
+        self.set_text_buffer(text)
+        self.scroller.set_min_content_width(max(240, width - 2 * padding - 2 * inner_margin))
+        self.scroller.set_min_content_height(max(80, height - 128 - 2 * padding))
+        x, y = target_position(self.settings, self.reference_window, width, height)
+        self.window.move(x, y)
+        self.window.set_default_size(width, height)
+        self.window.resize(width, height)
+        self.window.set_opacity(self.visible_opacity)
+        self.outer.show_all()
+        self.buttons.show_all()
+        self.window.show_all()
+        self.window.present()
+        self.window.set_focus(self.textview)
+        self.textview.grab_focus()
+        GLib.timeout_add(120, self.force_preview_focus)
+        GLib.timeout_add(320, self.force_preview_focus)
+        return False
+
+    def window_xid(self):
+        gdk_window = self.window.get_window()
+        if not gdk_window:
+            return None
+        try:
+            return str(gdk_window.get_xid())
+        except AttributeError:
+            return None
+
+    def force_preview_focus(self):
+        if not self.pending_conn:
+            return False
+
+        self.window.set_accept_focus(True)
+        self.window.present_with_time(Gdk.CURRENT_TIME)
+        self.window.set_focus(self.textview)
+        self.textview.grab_focus()
+
+        xid = self.window_xid()
+        if xid:
+            try:
+                subprocess.run(
+                    [XDOTOOL, "windowraise", xid, "windowactivate", xid, "windowfocus", xid],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    timeout=1,
+                    check=False,
+                )
+            except (OSError, subprocess.TimeoutExpired):
+                pass
+
+        self.window.set_focus(self.textview)
+        self.textview.grab_focus()
+        return False
+
+    def send_preview_response(self, text):
+        conn = self.pending_conn
+        self.pending_conn = None
+        self.window.set_accept_focus(False)
+        self.window.set_focus_on_map(False)
+        self.window.hide()
+        if not conn:
+            return
+        try:
+            payload = json.dumps({"ok": True, "text": text}) + "\n"
+            conn.sendall(payload.encode("utf-8"))
+        except OSError:
+            pass
+        finally:
+            try:
+                conn.close()
+            except OSError:
+                pass
+
+    def on_insert(self, *_args):
+        self.send_preview_response(self.get_text_buffer())
+
+    def on_cancel(self, *_args):
+        self.send_preview_response("")
+
+    def cancel_if_pending(self):
+        if self.pending_conn:
+            self.send_preview_response("")
+        else:
+            self.window.hide()
+        return False
+
+
+class PopupDaemon:
+    def __init__(self):
+        self.reference_window = None
+        self.status = StatusWindow()
+        self.preview = PreviewWindow()
+
+    def show_status(self, title, reference_window=None):
+        self.reference_window = reference_window or self.reference_window
+        self.preview.cancel_if_pending()
+        self.status.show(title, self.reference_window)
+        return False
+
+    def show_preview(self, text, conn, reference_window=None):
+        self.reference_window = reference_window or self.reference_window
+        self.status.hide()
+        self.preview.show(text, conn, self.reference_window)
+        return False
+
+    def hide(self):
+        self.status.hide()
+        self.preview.cancel_if_pending()
+        return False
+
+
+def socket_server(ui):
+    os.makedirs(STATE_DIR, exist_ok=True)
+    try:
+        os.unlink(SOCKET_PATH)
+    except FileNotFoundError:
+        pass
+
+    server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    server.bind(SOCKET_PATH)
+    server.listen(8)
+
+    while True:
+        conn, _ = server.accept()
+        threading.Thread(target=handle_client, args=(ui, conn), daemon=True).start()
+
+
+def recv_line(conn):
+    chunks = []
+    while True:
+        chunk = conn.recv(4096)
+        if not chunk:
+            break
+        chunks.append(chunk)
+        if b"\n" in chunk:
+            break
+    if not chunks:
+        return ""
+    return b"".join(chunks).split(b"\n", 1)[0].decode("utf-8")
+
+
+def handle_client(ui, conn):
+    try:
+        line = recv_line(conn)
+        if not line:
+            conn.close()
+            return
+        message = json.loads(line)
+        command = message.get("cmd")
+        reference_window = message.get("reference_window")
+
+        if command == "recording":
+            GLib.idle_add(ui.show_status, "Recording", reference_window)
+            conn.sendall(b'{"ok": true}\n')
+            conn.close()
+        elif command == "transcribing":
+            GLib.idle_add(ui.show_status, "Transcribing", reference_window)
+            conn.sendall(b'{"ok": true}\n')
+            conn.close()
+        elif command == "preview":
+            text = message.get("text", "")
+            GLib.idle_add(ui.show_preview, text, conn, reference_window)
+        elif command == "hide":
+            GLib.idle_add(ui.hide)
+            conn.sendall(b'{"ok": true}\n')
+            conn.close()
+        elif command == "ping":
+            conn.sendall(b'{"ok": true}\n')
+            conn.close()
+        else:
+            conn.sendall(b'{"ok": false, "error": "unknown command"}\n')
+            conn.close()
+    except Exception as exc:
+        try:
+            payload = json.dumps({"ok": False, "error": str(exc)}) + "\n"
+            conn.sendall(payload.encode("utf-8"))
+            conn.close()
+        except OSError:
+            pass
+
+
+def run_daemon():
+    ui = PopupDaemon()
+    threading.Thread(target=socket_server, args=(ui,), daemon=True).start()
+    Gtk.main()
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("command", choices=["daemon", "recording", "transcribing", "preview", "hide", "ping"])
+    parser.add_argument("--reference-window")
+    args = parser.parse_args()
+
+    if args.command == "daemon":
+        run_daemon()
+        return 0
+
+    if args.command == "preview":
+        text = sys.stdin.read()
+        response = socket_request(
+            {"cmd": "preview", "reference_window": args.reference_window},
+            wait_response=True,
+            stdin_text=text,
+        )
+        sys.stdout.write(response.get("text", ""))
+        return 0
+
+    response = socket_request(
+        {"cmd": args.command, "reference_window": args.reference_window},
+        wait_response=True,
+    )
+    return 0 if response.get("ok") else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

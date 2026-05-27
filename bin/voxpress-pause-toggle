@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if systemctl --user is-active --quiet voxpress-pause-listener.service; then
+  exec voxpress-pause-disable
+else
+  exec voxpress-pause-enable
+fi

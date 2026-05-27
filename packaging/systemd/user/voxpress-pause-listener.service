@@ -1,0 +1,13 @@
+[Unit]
+Description=Voxpress X11 hold-to-talk listener
+After=graphical-session.target voxtype.service
+Wants=voxtype.service
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/voxpress-pause-listener
+Restart=always
+RestartSec=1
+
+[Install]
+WantedBy=default.target

@@ -1,0 +1,23 @@
+[output]
+mode = "clipboard"
+fallback_to_clipboard = true
+driver_order = ["xclip"]
+pre_output_command = "~/.local/bin/voxpress-save-clipboard-x11"
+post_output_command = "~/.local/bin/voxpress-paste-x11"
+
+[output.post_process]
+command = "~/.local/bin/voxpress-postprocess-preview"
+timeout_ms = 300000
+trim = false
+fallback_on_empty = false
+
+[output.notification]
+on_recording_start = false
+on_recording_stop = false
+on_transcription = false
+
+[hotkey]
+enabled = false
+
+[osd]
+enabled = false
