@@ -1,0 +1,787 @@
+#!/usr/bin/env python3
+import argparse
+import json
+import os
+import re
+import shutil
+import shlex
+import sqlite3
+import subprocess
+import sys
+import tempfile
+import time
+import unicodedata
+from datetime import datetime
+from pathlib import Path
+
+
+DEFAULT_SETTINGS_PATH = os.path.expanduser("~/.config/voxpress/settings.json")
+DEFAULT_CORRECTION_DIR = os.path.expanduser("~/.local/share/voxpress/corrections")
+DEFAULT_RUNS_DIR = os.path.expanduser("~/.local/share/voxpress/models/runs")
+DEFAULT_VOXTYPE_CONFIG = os.path.expanduser("~/.config/voxtype/config.toml")
+
+
+def print_json(payload):
+    print(json.dumps(payload, ensure_ascii=False, sort_keys=True))
+
+
+def settings_path():
+    return os.environ.get(
+        "VOXTYPE_POPUP_SETTINGS",
+        os.environ.get("VOXPRESS_SETTINGS", DEFAULT_SETTINGS_PATH),
+    )
+
+
+def load_settings():
+    try:
+        with open(settings_path(), "r", encoding="utf-8") as handle:
+            raw = json.load(handle)
+    except (OSError, json.JSONDecodeError):
+        raw = {}
+    return raw if isinstance(raw, dict) else {}
+
+
+def int_setting(settings, env_key, settings_key, default):
+    raw = os.environ.get(env_key, settings.get(settings_key, default))
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return default
+
+
+def optional_timeout_env(env_key):
+    raw = os.environ.get(env_key)
+    if raw is None:
+        return None
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        return None
+    if value <= 0:
+        return None
+    return value
+
+
+def bool_setting(settings, env_key, settings_key, default):
+    raw = os.environ.get(env_key)
+    if raw is None:
+        return bool(settings.get(settings_key, default))
+    return raw.strip().lower() in ("1", "true", "yes", "on")
+
+
+def correction_root():
+    return Path(os.environ.get("VOXPRESS_CORRECTION_DIR", DEFAULT_CORRECTION_DIR))
+
+
+def runs_root():
+    return Path(os.environ.get("VOXPRESS_MODEL_RUNS_DIR", DEFAULT_RUNS_DIR))
+
+
+def current_model_path():
+    configured = os.environ.get("VOXPRESS_CURRENT_MODEL_PATH")
+    if configured:
+        return Path(configured).expanduser()
+    return runs_root().parent / "current" / "voxpress-personal-whisper.bin"
+
+
+def state_path():
+    return correction_root() / "auto_train_state.json"
+
+
+def load_state():
+    try:
+        return json.loads(state_path().read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def save_state(state):
+    path = state_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(state, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+
+def nvidia_smi_bin():
+    return os.environ.get("VOXPRESS_NVIDIA_SMI", "nvidia-smi")
+
+
+def run_command(cmd, timeout=10):
+    return subprocess.run(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        timeout=timeout,
+        check=False,
+    )
+
+
+def parse_int_lines(output):
+    values = []
+    for line in output.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            values.append(int(line.split()[0].strip()))
+        except (ValueError, IndexError):
+            continue
+    return values
+
+
+def gpu_idle_once(settings):
+    threshold = int_setting(settings, "VOXPRESS_GPU_BUSY_UTILIZATION_PERCENT", "gpu_busy_utilization_percent", 30)
+    memory_threshold = int_setting(
+        settings,
+        "VOXPRESS_GPU_BUSY_PROCESS_MEMORY_MB",
+        "gpu_busy_process_memory_mb",
+        4096,
+    )
+    nvidia_smi = nvidia_smi_bin()
+
+    try:
+        gpu = run_command(
+            [nvidia_smi, "--query-gpu=utilization.gpu", "--format=csv,noheader,nounits"],
+            timeout=5,
+        )
+        if gpu.returncode != 0:
+            return False, "nvidia_smi_failed"
+        if any(value > threshold for value in parse_int_lines(gpu.stdout)):
+            return False, "gpu_utilization_busy"
+
+        apps = run_command(
+            [
+                nvidia_smi,
+                "--query-compute-apps=pid,used_memory",
+                "--format=csv,noheader,nounits",
+            ],
+            timeout=5,
+        )
+        if apps.returncode != 0:
+            return False, "nvidia_smi_apps_failed"
+        for line in apps.stdout.splitlines():
+            parts = [part.strip() for part in line.split(",")]
+            if len(parts) >= 2:
+                try:
+                    if int(parts[1].split()[0]) > memory_threshold:
+                        return False, "gpu_memory_busy"
+                except ValueError:
+                    continue
+
+        pmon = run_command([nvidia_smi, "pmon", "-c", "1", "-s", "u"], timeout=5)
+        if pmon.returncode != 0:
+            return False, "nvidia_smi_pmon_failed"
+        for line in pmon.stdout.splitlines():
+            stripped = line.strip()
+            if not stripped or stripped.startswith("#"):
+                continue
+            parts = stripped.split()
+            if len(parts) >= 4:
+                try:
+                    if int(parts[3]) > threshold:
+                        return False, "gpu_process_busy"
+                except ValueError:
+                    continue
+    except (OSError, subprocess.TimeoutExpired):
+        return False, "nvidia_smi_unavailable"
+
+    return True, "idle"
+
+
+def gpu_idle(settings):
+    count = int_setting(settings, "VOXPRESS_GPU_CHECK_COUNT", "gpu_check_count", 2)
+    interval = float(
+        os.environ.get(
+            "VOXPRESS_GPU_CHECK_INTERVAL_SECONDS",
+            settings.get("gpu_check_interval_seconds", 300),
+        )
+    )
+    reasons = []
+    for index in range(max(1, count)):
+        ok, reason = gpu_idle_once(settings)
+        reasons.append(reason)
+        if not ok:
+            return False, reasons
+        if index < count - 1 and interval > 0:
+            time.sleep(interval)
+    return True, reasons
+
+
+def connect_samples(root):
+    db_path = root / "index.sqlite"
+    if not db_path.exists():
+        return []
+    conn = sqlite3.connect(db_path)
+    try:
+        rows = conn.execute(
+            """
+            select id, audio_path, corrected_text, created_at
+            from samples
+            order by created_at asc, id asc
+            """
+        ).fetchall()
+    finally:
+        conn.close()
+    samples = []
+    for sid, relative_audio, corrected_text, created_at in rows:
+        audio_path = root / relative_audio
+        if audio_path.is_file() and str(corrected_text).strip():
+            samples.append(
+                {
+                    "id": sid,
+                    "audio_path": str(audio_path),
+                    "text": corrected_text,
+                    "created_at": created_at,
+                }
+            )
+    return samples
+
+
+def ensure_aux_tables(conn):
+    conn.execute(
+        """
+        create table if not exists training_runs (
+            id text primary key,
+            created_at text not null,
+            status text not null,
+            log_path text,
+            model_path text
+        )
+        """
+    )
+    conn.execute(
+        """
+        create table if not exists promotions (
+            id integer primary key autoincrement,
+            created_at text not null,
+            model_path text not null,
+            previous_model_path text
+        )
+        """
+    )
+    conn.commit()
+
+
+def record_training_run(run_id, status, run_dir, model_path=None):
+    root = correction_root()
+    db_path = root / "index.sqlite"
+    if not db_path.exists():
+        return
+    conn = sqlite3.connect(db_path)
+    try:
+        ensure_aux_tables(conn)
+        conn.execute(
+            """
+            insert or replace into training_runs
+            (id, created_at, status, log_path, model_path)
+            values (?, ?, ?, ?, ?)
+            """,
+            (run_id, datetime.now().astimezone().isoformat(), status, str(run_dir), model_path),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def record_promotion(model_path, previous_model_path=None):
+    root = correction_root()
+    db_path = root / "index.sqlite"
+    if not db_path.exists():
+        return
+    conn = sqlite3.connect(db_path)
+    try:
+        ensure_aux_tables(conn)
+        conn.execute(
+            """
+            insert into promotions (created_at, model_path, previous_model_path)
+            values (?, ?, ?)
+            """,
+            (datetime.now().astimezone().isoformat(), model_path, previous_model_path),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def write_manifest(samples, path):
+    payload = {"sample_count": len(samples), "samples": samples}
+    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+
+def training_python(settings):
+    configured = os.environ.get("VOXPRESS_TRAIN_PYTHON") or settings.get("training_python_path")
+    if configured:
+        return str(configured)
+    return sys.executable
+
+
+def default_train_command(manifest, output_dir, max_minutes, max_epochs, settings):
+    script = Path(__file__).resolve().with_name("voxpress-train-whisper-lora")
+    return [
+        training_python(settings),
+        str(script),
+        "--manifest",
+        str(manifest),
+        "--output-dir",
+        str(output_dir),
+        "--max-minutes",
+        str(max_minutes),
+        "--max-epochs",
+        str(max_epochs),
+    ]
+
+
+def train_command(manifest, output_dir, max_minutes, max_epochs, settings):
+    template = os.environ.get("VOXPRESS_TRAIN_COMMAND")
+    if template:
+        return shlex.split(
+            template.format(
+                manifest=str(manifest),
+                output_dir=str(output_dir),
+                max_minutes=str(max_minutes),
+                max_epochs=str(max_epochs),
+            )
+        )
+    return default_train_command(manifest, output_dir, max_minutes, max_epochs, settings)
+
+
+def train_watchdog_timeout(settings, max_minutes):
+    _ = settings, max_minutes
+    return optional_timeout_env("VOXPRESS_DAILY_TRAIN_WATCHDOG_SECONDS")
+
+
+def default_trainer_dependency_check(settings):
+    if os.environ.get("VOXPRESS_TRAIN_COMMAND"):
+        return True, "custom_train_command"
+    script = Path(__file__).resolve().with_name("voxpress-train-whisper-lora")
+    try:
+        result = subprocess.run(
+            [training_python(settings), str(script), "--check-deps"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return False, f"dependency_check_failed: {exc}"
+    if result.returncode == 0:
+        return True, "ok"
+    reason = result.stderr.strip() or result.stdout.strip() or "training_dependencies_missing"
+    return False, reason
+
+
+def update_toml_key(path, section, key, value_literal):
+    try:
+        lines = Path(path).read_text(encoding="utf-8").splitlines(keepends=True)
+    except OSError:
+        lines = []
+
+    section_header = f"[{section}]"
+    output = []
+    in_section = False
+    inserted = False
+    saw_section = False
+    for line in lines:
+        stripped = line.strip()
+        if stripped.startswith("[") and stripped.endswith("]"):
+            if in_section and not inserted:
+                output.append(f"{key} = {value_literal}\n")
+                inserted = True
+            in_section = stripped == section_header
+            saw_section = saw_section or in_section
+        if in_section and stripped.startswith(f"{key} "):
+            output.append(f"{key} = {value_literal}\n")
+            inserted = True
+            continue
+        output.append(line)
+
+    if not saw_section:
+        if output and not output[-1].endswith("\n"):
+            output[-1] += "\n"
+        output.append(f"\n{section_header}\n")
+        output.append(f"{key} = {value_literal}\n")
+    elif in_section and not inserted:
+        output.append(f"{key} = {value_literal}\n")
+
+    target = Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_path = tempfile.mkstemp(prefix=".voxpress-config-", suffix=".toml", dir=target.parent)
+    with os.fdopen(fd, "w", encoding="utf-8") as handle:
+        handle.writelines(output)
+    os.replace(tmp_path, target)
+
+
+def remove_toml_key(path, section, key):
+    try:
+        lines = Path(path).read_text(encoding="utf-8").splitlines(keepends=True)
+    except OSError:
+        return
+
+    output = []
+    in_section = False
+    section_header = f"[{section}]"
+    for line in lines:
+        stripped = line.strip()
+        if stripped.startswith("[") and stripped.endswith("]"):
+            in_section = stripped == section_header
+        if in_section and stripped.startswith(f"{key} "):
+            continue
+        output.append(line)
+
+    target = Path(path)
+    fd, tmp_path = tempfile.mkstemp(prefix=".voxpress-config-", suffix=".toml", dir=target.parent)
+    with os.fdopen(fd, "w", encoding="utf-8") as handle:
+        handle.writelines(output)
+    os.replace(tmp_path, target)
+
+
+def current_toml_key(path, section, key):
+    try:
+        lines = Path(path).read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return None
+    in_section = False
+    for line in lines:
+        stripped = line.strip()
+        if stripped.startswith("[") and stripped.endswith("]"):
+            in_section = stripped == f"[{section}]"
+            continue
+        if in_section and stripped.startswith(f"{key} "):
+            return stripped.split("=", 1)[1].strip().strip('"')
+    return None
+
+
+def restart_voxtype():
+    systemctl = os.environ.get("VOXPRESS_SYSTEMCTL", "systemctl")
+    return run_command([systemctl, "--user", "restart", "voxtype.service"], timeout=20).returncode == 0
+
+
+def whisper_wrapper_path():
+    return os.environ.get(
+        "VOXPRESS_WHISPER_CLI_WRAPPER",
+        str(Path(__file__).resolve().with_name("voxpress-whisper-cli-wrapper")),
+    )
+
+
+def voxtype_bin():
+    return os.environ.get("VOXPRESS_VOXTYPE_BIN", os.path.expanduser("~/.local/bin/voxtype"))
+
+
+def wrapper_marker(path):
+    try:
+        payload = json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def is_promotable_deploy_model(model_path):
+    if not model_path:
+        return False, "missing_deploy_model"
+    path = Path(model_path)
+    if not path.is_file():
+        return False, "deploy_model_missing"
+    marker = wrapper_marker(path)
+    if marker and marker.get("deploy_type") == "voxpress-whisper-cli-wrapper":
+        return False, "deploy_model_not_promotable"
+    return True, "ok"
+
+
+def model_smoke_test(model_path, samples, output_dir):
+    if os.environ.get("VOXPRESS_SKIP_MODEL_SMOKE_TEST", "0") == "1":
+        return True, "skipped"
+    if not samples:
+        return False, "no_smoke_sample"
+    promotable, reason = is_promotable_deploy_model(model_path)
+    if not promotable:
+        return False, reason
+
+    sample = samples[0]
+    smoke_config = write_smoke_config(model_path, output_dir)
+    cmd = [
+        voxtype_bin(),
+        "--config",
+        str(smoke_config),
+        "--whisper-mode",
+        "local",
+        "transcribe",
+        sample["audio_path"],
+    ]
+    try:
+        result = subprocess.run(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=int(os.environ.get("VOXPRESS_MODEL_SMOKE_TIMEOUT_SECONDS", "180")),
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return False, f"smoke_spawn_failed: {exc}"
+
+    (output_dir / "model-smoke.stdout.log").write_text(result.stdout, encoding="utf-8")
+    (output_dir / "model-smoke.stderr.log").write_text(result.stderr, encoding="utf-8")
+    if result.returncode != 0:
+        return False, "smoke_command_failed"
+    lines = [line.strip() for line in result.stdout.splitlines() if line.strip()]
+    text = lines[-1] if lines else ""
+    if not text:
+        return False, "smoke_output_empty"
+    if is_degenerate_transcription(text):
+        return False, "smoke_output_degenerate"
+    return True, "ok"
+
+
+def write_smoke_config(model_path, output_dir):
+    source_path = Path(os.environ.get("VOXTYPE_CONFIG_PATH", DEFAULT_VOXTYPE_CONFIG))
+    Path(output_dir).mkdir(parents=True, exist_ok=True)
+    smoke_config = Path(output_dir) / "model-smoke.config.toml"
+    try:
+        content = source_path.read_text(encoding="utf-8")
+    except OSError:
+        content = "[whisper]\n"
+    smoke_config.write_text(content, encoding="utf-8")
+    update_toml_key(smoke_config, "whisper", "model", json.dumps(str(model_path)))
+    update_toml_key(smoke_config, "whisper", "mode", json.dumps("local"))
+    remove_toml_key(smoke_config, "whisper", "whisper_cli_path")
+    return smoke_config
+
+
+def is_degenerate_transcription(text):
+    compact = "".join(character for character in text.strip() if not character.isspace())
+    if len(compact) < 12:
+        return False
+    counts = {}
+    for character in compact:
+        counts[character] = counts.get(character, 0) + 1
+    if max(counts.values()) / len(compact) > 0.60:
+        return True
+    for unit_size in range(2, min(16, len(compact) // 4) + 1):
+        if re.search(r"(.{%d})\1{4,}" % unit_size, compact):
+            return True
+    tokens = [token.lower() for token in re.findall(r"[^\W_]+", text, flags=re.UNICODE)]
+    if len(tokens) >= 12:
+        token_counts = {}
+        for token in tokens:
+            token_counts[token] = token_counts.get(token, 0) + 1
+        if max(token_counts.values()) / len(tokens) > 0.35:
+            return True
+    meaningful = [
+        character
+        for character in compact
+        if unicodedata.category(character)[0] in {"L", "N"}
+    ]
+    return len(meaningful) / len(compact) < 0.20
+
+
+def install_current_model(model_path, run_dir=None):
+    source = Path(model_path)
+    target = current_model_path()
+    target.parent.mkdir(parents=True, exist_ok=True)
+    if source.resolve() != target.resolve():
+        tmp_path = target.with_name(target.name + ".tmp")
+        shutil.copyfile(source, tmp_path)
+        os.replace(tmp_path, target)
+    metadata = {
+        "promoted_at": datetime.now().astimezone().isoformat(),
+        "source_model_path": str(source),
+        "source_run_dir": str(run_dir) if run_dir else None,
+        "model_path": str(target),
+    }
+    (target.parent / "metadata.json").write_text(
+        json.dumps(metadata, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    return target
+
+
+def cleanup_after_promotion(active_run_dir):
+    root = runs_root()
+    active = Path(active_run_dir).resolve()
+    if root.is_dir():
+        for candidate in root.iterdir():
+            if not candidate.is_dir():
+                continue
+            if candidate.resolve() == active:
+                continue
+            shutil.rmtree(candidate, ignore_errors=True)
+    if active.is_dir():
+        for name in ("deploy", "adapter", "processor"):
+            shutil.rmtree(active / name, ignore_errors=True)
+        for artifact in active.glob("*.bin"):
+            artifact.unlink(missing_ok=True)
+
+
+def promote_model(model_path, run_dir=None):
+    promotable, _reason = is_promotable_deploy_model(model_path)
+    if not promotable:
+        return None
+    current_model = install_current_model(model_path, run_dir=run_dir)
+    config_path = os.environ.get("VOXTYPE_CONFIG_PATH", DEFAULT_VOXTYPE_CONFIG)
+    previous = current_toml_key(config_path, "whisper", "model")
+    update_toml_key(config_path, "whisper", "model", json.dumps(str(current_model)))
+    remove_toml_key(config_path, "whisper", "mode")
+    remove_toml_key(config_path, "whisper", "whisper_cli_path")
+    restart_voxtype()
+    record_promotion(str(current_model), previous)
+    return str(current_model)
+
+
+def result_manifest(output_dir):
+    path = output_dir / "train-result.json"
+    if not path.is_file():
+        return {}
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return {}
+
+
+def update_result_after_promotion(output_dir, source_model_path, promoted_model_path):
+    path = Path(output_dir) / "train-result.json"
+    payload = result_manifest(Path(output_dir))
+    if not isinstance(payload, dict):
+        payload = {}
+    payload["source_deploy_model_path"] = str(source_model_path)
+    payload["deploy_model_path"] = str(promoted_model_path)
+    payload["promoted_model_path"] = str(promoted_model_path)
+    payload["deploy_ready"] = True
+    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+
+def run_daily(args):
+    settings = load_settings()
+    if not args.force_time and not bool_setting(settings, "VOXPRESS_AUTO_TRAIN_ENABLED", "auto_train_enabled", True):
+        return {"status": "skipped", "reason": "auto_train_disabled"}
+    if not args.force_time:
+        now = datetime.now()
+        train_time = str(settings.get("auto_train_time", "04:00"))
+        if now.strftime("%H:%M") < train_time:
+            return {"status": "skipped", "reason": "waiting_for_train_time"}
+        state = load_state()
+        if state.get("last_attempt_date") == now.strftime("%Y-%m-%d"):
+            return {"status": "skipped", "reason": "already_ran_today"}
+
+    samples = connect_samples(correction_root())
+    if not samples:
+        return {"status": "skipped", "reason": "no_samples"}
+
+    if not args.ignore_gpu:
+        idle, reasons = gpu_idle(settings)
+        if not idle:
+            return {"status": "skipped", "reason": "gpu_busy", "gpu_checks": reasons}
+
+    deps_ok, deps_reason = default_trainer_dependency_check(settings)
+    if not deps_ok:
+        return {"status": "skipped", "reason": "training_dependencies_missing", "details": deps_reason}
+
+    run_id = datetime.now().strftime("%Y%m%dT%H%M%S")
+    output_dir = runs_root() / run_id
+    output_dir.mkdir(parents=True, exist_ok=True)
+    manifest = output_dir / "train-manifest.json"
+    write_manifest(samples, manifest)
+    max_minutes = int_setting(settings, "VOXPRESS_AUTO_TRAIN_MAX_MINUTES", "auto_train_max_minutes", 30)
+    max_epochs = int_setting(settings, "VOXPRESS_AUTO_TRAIN_MAX_EPOCHS", "auto_train_max_epochs", 5)
+    cmd = train_command(manifest, output_dir, max_minutes, max_epochs, settings)
+    timeout_seconds = train_watchdog_timeout(settings, max_minutes)
+    try:
+        result = subprocess.run(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=timeout_seconds,
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        record_training_run(run_id, "train_timeout", output_dir)
+        mark_daily_attempt()
+        return {"status": "failed", "reason": "train_timeout", "run_dir": str(output_dir)}
+    except OSError as exc:
+        record_training_run(run_id, "train_spawn_failed", output_dir)
+        mark_daily_attempt()
+        return {"status": "failed", "reason": f"train_spawn_failed: {exc}", "run_dir": str(output_dir)}
+
+    (output_dir / "train.stdout.log").write_text(result.stdout, encoding="utf-8")
+    (output_dir / "train.stderr.log").write_text(result.stderr, encoding="utf-8")
+    if result.returncode != 0:
+        record_training_run(run_id, "train_failed", output_dir)
+        mark_daily_attempt()
+        return {"status": "failed", "reason": "train_failed", "run_dir": str(output_dir)}
+
+    train_result = result_manifest(output_dir)
+    deploy_model_path = train_result.get("deploy_model_path")
+    if not deploy_model_path:
+        record_training_run(run_id, "trained_not_deployable", output_dir)
+        mark_daily_attempt()
+        return {
+            "status": "trained",
+            "reason": train_result.get("deploy_reason", "no_deploy_model"),
+            "run_dir": str(output_dir),
+        }
+
+    promotable, promotable_reason = is_promotable_deploy_model(deploy_model_path)
+    if not promotable:
+        record_training_run(run_id, "trained_not_deployable", output_dir, deploy_model_path)
+        mark_daily_attempt()
+        return {
+            "status": "trained",
+            "reason": promotable_reason,
+            "model_path": deploy_model_path,
+            "run_dir": str(output_dir),
+        }
+
+    if not bool_setting(settings, "VOXPRESS_AUTO_PROMOTE_MODEL", "auto_promote_model", True):
+        record_training_run(run_id, "trained_not_promoted", output_dir, deploy_model_path)
+        mark_daily_attempt()
+        return {"status": "trained", "reason": "auto_promote_disabled", "model_path": deploy_model_path, "run_dir": str(output_dir)}
+
+    smoke_ok, smoke_reason = model_smoke_test(deploy_model_path, samples, output_dir)
+    if not smoke_ok:
+        record_training_run(run_id, "smoke_failed", output_dir, deploy_model_path)
+        mark_daily_attempt()
+        return {"status": "failed", "reason": smoke_reason, "run_dir": str(output_dir)}
+
+    promoted_model_path = promote_model(deploy_model_path, run_dir=output_dir)
+    if promoted_model_path:
+        update_result_after_promotion(output_dir, deploy_model_path, promoted_model_path)
+        record_training_run(run_id, "promoted", output_dir, promoted_model_path)
+        mark_daily_attempt()
+        cleanup_after_promotion(output_dir)
+        return {"status": "promoted", "model_path": promoted_model_path, "run_dir": str(output_dir)}
+    record_training_run(run_id, "promotion_failed", output_dir, deploy_model_path)
+    mark_daily_attempt()
+    return {"status": "failed", "reason": "promotion_failed", "run_dir": str(output_dir)}
+
+
+def mark_daily_attempt():
+    state = load_state()
+    state["last_attempt_date"] = datetime.now().strftime("%Y-%m-%d")
+    state["last_attempt_at"] = datetime.now().astimezone().isoformat()
+    save_state(state)
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    subparsers = parser.add_subparsers(dest="command", required=True)
+    run = subparsers.add_parser("run")
+    run.add_argument("--force-time", action="store_true")
+    run.add_argument("--ignore-gpu", action="store_true")
+    subparsers.add_parser("check-gpu")
+    args = parser.parse_args()
+
+    if args.command == "check-gpu":
+        ok, reasons = gpu_idle(load_settings())
+        print_json({"idle": ok, "checks": reasons})
+        return 0
+
+    if args.command == "run":
+        print_json(run_daily(args))
+        return 0
+
+    return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

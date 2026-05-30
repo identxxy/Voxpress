@@ -1,0 +1,215 @@
+#!/usr/bin/env python3
+import argparse
+import json
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+
+os.environ.setdefault("HF_HUB_DISABLE_XET", "1")
+
+
+DEFAULT_TOOL_ROOT = Path(os.environ.get("VOXPRESS_WHISPER_TOOL_ROOT", "~/.local/share/voxpress/tools")).expanduser()
+
+
+def print_json(payload):
+    print(json.dumps(payload, ensure_ascii=False, sort_keys=True))
+
+
+def find_bin_candidates(path):
+    root = Path(path)
+    if not root.exists():
+        return []
+    def is_deploy_candidate(candidate):
+        try:
+            relative_parts = candidate.relative_to(root).parts
+        except ValueError:
+            relative_parts = candidate.parts
+        return "merged-hf" not in relative_parts
+
+    return sorted(
+        [candidate for candidate in root.rglob("*.bin") if candidate.is_file() and is_deploy_candidate(candidate)],
+        key=lambda candidate: (candidate.stat().st_size, str(candidate)),
+        reverse=True,
+    )
+
+
+def merge_lora_to_hf(base_model, adapter_dir, processor_dir, merged_dir):
+    try:
+        import torch
+        from peft import PeftModel
+        from transformers import WhisperForConditionalGeneration, WhisperProcessor
+    except ImportError as exc:
+        return False, f"merge_dependency_missing: {exc}"
+
+    merged_dir = Path(merged_dir)
+    merged_dir.mkdir(parents=True, exist_ok=True)
+    model = WhisperForConditionalGeneration.from_pretrained(base_model, torch_dtype=torch.float32)
+    model = PeftModel.from_pretrained(model, adapter_dir)
+    model = model.merge_and_unload()
+    model.save_pretrained(merged_dir, safe_serialization=False)
+    processor = WhisperProcessor.from_pretrained(processor_dir)
+    processor.save_pretrained(merged_dir)
+    return True, "ok"
+
+
+def run_custom_export(args, merged_dir):
+    template = os.environ.get("VOXPRESS_WHISPER_EXPORT_COMMAND")
+    if not template:
+        return None
+    command = template.format(
+        base_model=args.base_model,
+        adapter_dir=str(args.adapter_dir),
+        processor_dir=str(args.processor_dir),
+        merged_dir=str(merged_dir),
+        output_dir=str(args.output_dir),
+    )
+    args.output_dir.mkdir(parents=True, exist_ok=True)
+    result = subprocess.run(
+        command,
+        shell=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        check=False,
+    )
+    (args.output_dir / "custom-export.stdout.log").write_text(result.stdout, encoding="utf-8")
+    (args.output_dir / "custom-export.stderr.log").write_text(result.stderr, encoding="utf-8")
+    if result.returncode != 0:
+        return {"status": "export_failed", "reason": "custom_export_failed", "deploy_model_path": None}
+    candidates = find_bin_candidates(args.output_dir)
+    if not candidates:
+        return {"status": "export_failed", "reason": "custom_export_no_bin", "deploy_model_path": None}
+    return {
+        "status": "exported",
+        "reason": "custom_export",
+        "deploy_model_path": str(candidates[0]),
+        "deploy_runtime": "voxtype_local",
+        "artifact_format": "whisper.cpp",
+    }
+
+
+def converter_config():
+    convert_script = os.environ.get("VOXPRESS_WHISPER_CPP_CONVERT_SCRIPT")
+    if not convert_script:
+        convert_script = str(DEFAULT_TOOL_ROOT / "whisper.cpp" / "models" / "convert-h5-to-ggml.py")
+    openai_whisper_repo = os.environ.get("VOXPRESS_OPENAI_WHISPER_REPO")
+    if not openai_whisper_repo:
+        openai_whisper_repo = str(DEFAULT_TOOL_ROOT / "whisper")
+    if not convert_script:
+        return None, "missing_whisper_cpp_convert_script"
+    if not Path(convert_script).is_file():
+        return None, "missing_whisper_cpp_convert_script"
+    if not openai_whisper_repo or not Path(openai_whisper_repo).is_dir():
+        return None, "missing_openai_whisper_repo"
+    return (convert_script, openai_whisper_repo), "ok"
+
+
+def run_whisper_cpp_export(args, merged_dir):
+    config, reason = converter_config()
+    if not config:
+        return {"status": "export_unavailable", "reason": reason, "deploy_model_path": None}
+    convert_script, openai_whisper_repo = config
+    args.output_dir.mkdir(parents=True, exist_ok=True)
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(convert_script),
+            str(merged_dir),
+            str(openai_whisper_repo),
+            str(args.output_dir),
+        ],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        check=False,
+    )
+    (args.output_dir / "whisper-cpp-convert.stdout.log").write_text(result.stdout, encoding="utf-8")
+    (args.output_dir / "whisper-cpp-convert.stderr.log").write_text(result.stderr, encoding="utf-8")
+    if result.returncode != 0:
+        return {"status": "export_failed", "reason": "whisper_cpp_convert_failed", "deploy_model_path": None}
+    candidates = find_bin_candidates(args.output_dir)
+    if not candidates:
+        return {"status": "export_failed", "reason": "whisper_cpp_convert_no_bin", "deploy_model_path": None}
+    deploy_model = candidates[0]
+    quantized = maybe_quantize(deploy_model, args.output_dir)
+    if quantized:
+        deploy_model = quantized
+    return {
+        "status": "exported",
+        "reason": "whisper_cpp_export",
+        "deploy_model_path": str(deploy_model),
+        "deploy_runtime": "voxtype_local",
+        "artifact_format": "whisper.cpp",
+    }
+
+
+def maybe_quantize(source_model, output_dir):
+    quant_type = os.environ.get("VOXPRESS_WHISPER_QUANTIZE_TYPE", "q5_0").strip()
+    if quant_type.lower() in ("", "0", "false", "no", "none", "off", "disabled"):
+        return None
+
+    quantize_bin = os.environ.get("VOXPRESS_WHISPER_CPP_QUANTIZE_BIN")
+    if not quantize_bin:
+        candidates = [
+            DEFAULT_TOOL_ROOT / "whisper.cpp-current" / "build" / "bin" / "quantize",
+            DEFAULT_TOOL_ROOT / "whisper.cpp-current" / "build" / "bin" / "whisper-quantize",
+        ]
+        if os.environ.get("VOXPRESS_ALLOW_LEGACY_WHISPER_QUANTIZE", "0").strip().lower() in ("1", "true", "yes", "on"):
+            candidates.extend(
+                [
+                    DEFAULT_TOOL_ROOT / "whisper.cpp" / "build" / "bin" / "quantize",
+                    DEFAULT_TOOL_ROOT / "whisper.cpp" / "build" / "bin" / "whisper-quantize",
+                ]
+            )
+        for candidate in candidates:
+            if candidate.is_file():
+                quantize_bin = str(candidate)
+                break
+    if not quantize_bin:
+        return None
+    quantize_path = Path(quantize_bin)
+    if not quantize_path.is_file():
+        return None
+    target = Path(output_dir) / f"voxpress-personal-whisper-{quant_type}.bin"
+    result = subprocess.run(
+        [str(quantize_path), str(source_model), str(target), quant_type],
+        text=True,
+        check=False,
+    )
+    if result.returncode == 0 and target.is_file():
+        return target
+    return None
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--base-model", required=True)
+    parser.add_argument("--adapter-dir", type=Path, required=True)
+    parser.add_argument("--processor-dir", type=Path, required=True)
+    parser.add_argument("--output-dir", type=Path, required=True)
+    args = parser.parse_args()
+
+    custom_export = os.environ.get("VOXPRESS_WHISPER_EXPORT_COMMAND")
+    converter, converter_reason = converter_config()
+    if not custom_export and not converter:
+        print_json({"status": "export_unavailable", "reason": converter_reason, "deploy_model_path": None})
+        return 0
+
+    merged_dir = args.output_dir / "merged-hf"
+    ok, reason = merge_lora_to_hf(args.base_model, args.adapter_dir, args.processor_dir, merged_dir)
+    if not ok:
+        print_json({"status": "export_failed", "reason": reason, "deploy_model_path": None})
+        return 0
+
+    if custom_export:
+        print_json(run_custom_export(args, merged_dir))
+        return 0
+
+    print_json(run_whisper_cpp_export(args, merged_dir))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

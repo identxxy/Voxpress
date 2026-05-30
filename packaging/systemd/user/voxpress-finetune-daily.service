@@ -1,0 +1,6 @@
+[Unit]
+Description=Voxpress daily personal fine-tune
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/voxpress-finetune-daily run

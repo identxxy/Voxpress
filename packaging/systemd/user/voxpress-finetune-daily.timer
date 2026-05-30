@@ -1,0 +1,9 @@
+[Unit]
+Description=Run Voxpress personal fine-tune scheduler
+
+[Timer]
+OnCalendar=*-*-* *:0/15:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target

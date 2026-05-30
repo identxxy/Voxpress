@@ -1,0 +1,116 @@
+#!/usr/bin/env python3
+import argparse
+import json
+import os
+import sys
+from pathlib import Path
+
+
+SETTINGS_PATH = os.environ.get(
+    "VOXTYPE_POPUP_SETTINGS",
+    os.environ.get("VOXPRESS_SETTINGS", os.path.expanduser("~/.config/voxpress/settings.json")),
+)
+
+
+def load_settings():
+    try:
+        with open(SETTINGS_PATH, "r", encoding="utf-8") as handle:
+            raw = json.load(handle)
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return raw if isinstance(raw, dict) else {}
+
+
+def maybe_reexec_with_training_python():
+    if os.environ.get("VOXPRESS_WRAPPER_REEXEC") == "1":
+        return
+    python_path = os.environ.get("VOXPRESS_TRAIN_PYTHON") or load_settings().get("training_python_path")
+    if not python_path:
+        return
+    python_path = os.path.expanduser(str(python_path))
+    if not os.path.isfile(python_path) or Path(sys.executable).resolve() == Path(python_path).resolve():
+        return
+    env = os.environ.copy()
+    env["VOXPRESS_WRAPPER_REEXEC"] = "1"
+    os.execve(python_path, [python_path, __file__, *sys.argv[1:]], env)
+
+
+maybe_reexec_with_training_python()
+
+
+def load_marker(path):
+    try:
+        return json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise SystemExit(f"Invalid Voxpress model marker {path}: {exc}") from exc
+
+
+def transcribe(marker, audio_file, language=None, prompt=None):
+    try:
+        import torch
+        from peft import PeftModel
+        from transformers import WhisperForConditionalGeneration, WhisperProcessor, pipeline
+    except ImportError as exc:
+        raise SystemExit(f"Missing Voxpress Whisper runtime dependency: {exc}") from exc
+
+    base_model = marker["base_model"]
+    adapter_dir = marker["adapter_dir"]
+    processor_dir = marker.get("processor_dir") or base_model
+    device = "cuda:0" if torch.cuda.is_available() else "cpu"
+    dtype = torch.float16 if torch.cuda.is_available() else torch.float32
+
+    processor = WhisperProcessor.from_pretrained(processor_dir, local_files_only=True)
+    model = WhisperForConditionalGeneration.from_pretrained(
+        base_model,
+        torch_dtype=dtype,
+        local_files_only=True,
+    )
+    model = PeftModel.from_pretrained(model, adapter_dir)
+    model = model.merge_and_unload()
+
+    generate_kwargs = {}
+    if language and language != "auto":
+        generate_kwargs["language"] = language
+    if prompt:
+        print("Warning: ignoring Whisper prompt in Voxpress wrapper", file=sys.stderr)
+
+    pipe = pipeline(
+        "automatic-speech-recognition",
+        model=model,
+        tokenizer=processor.tokenizer,
+        feature_extractor=processor.feature_extractor,
+        torch_dtype=dtype,
+        device=device,
+    )
+    result = pipe(str(audio_file), generate_kwargs=generate_kwargs)
+    return result["text"].strip()
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--model", required=True)
+    parser.add_argument("--file", required=True)
+    parser.add_argument("--output-json", action="store_true")
+    parser.add_argument("--output-file", required=True)
+    parser.add_argument("--threads")
+    parser.add_argument("--no-prints", action="store_true")
+    parser.add_argument("--language", default=None)
+    parser.add_argument("--translate", action="store_true")
+    parser.add_argument("--prompt", default=None)
+    args, _unknown = parser.parse_known_args()
+
+    marker = load_marker(args.model)
+    if marker.get("deploy_type") != "voxpress-whisper-cli-wrapper":
+        raise SystemExit(f"Unsupported Voxpress deploy_type in {args.model}")
+
+    text = transcribe(marker, args.file, language=args.language, prompt=args.prompt)
+    output_path = Path(f"{args.output_file}.json")
+    output_path.write_text(
+        json.dumps({"transcription": [{"text": text}]}, ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

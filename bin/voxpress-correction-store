@@ -1,0 +1,335 @@
+#!/usr/bin/env python3
+import argparse
+import hashlib
+import json
+import os
+import shutil
+import sqlite3
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+
+
+DEFAULT_MAX_STORAGE_MB = 256
+DEFAULT_MAX_SAMPLES = 1000
+DEFAULT_SETTINGS_PATH = os.path.expanduser("~/.config/voxpress/settings.json")
+
+
+def bool_from_env(value):
+    if value is None:
+        return None
+    normalized = value.strip().lower()
+    if normalized in ("1", "true", "yes", "on"):
+        return True
+    if normalized in ("0", "false", "no", "off"):
+        return False
+    return None
+
+
+def store_root():
+    return Path(
+        os.environ.get(
+            "VOXPRESS_CORRECTION_DIR",
+            os.path.expanduser("~/.local/share/voxpress/corrections"),
+        )
+    )
+
+
+def settings_path():
+    return os.environ.get(
+        "VOXTYPE_POPUP_SETTINGS",
+        os.environ.get("VOXPRESS_SETTINGS", DEFAULT_SETTINGS_PATH),
+    )
+
+
+def load_settings():
+    try:
+        with open(settings_path(), "r", encoding="utf-8") as handle:
+            raw = json.load(handle)
+    except (OSError, json.JSONDecodeError):
+        raw = {}
+    return raw if isinstance(raw, dict) else {}
+
+
+def collection_enabled(settings):
+    override = bool_from_env(os.environ.get("VOXPRESS_CORRECTION_COLLECTION"))
+    if override is not None:
+        return override
+    return bool(settings.get("correction_collection_enabled", True))
+
+
+def int_setting(settings, env_key, settings_key, default, low=None):
+    raw = os.environ.get(env_key, settings.get(settings_key, default))
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        value = default
+    if low is not None:
+        value = max(low, value)
+    return value
+
+
+def ensure_schema(conn):
+    conn.execute(
+        """
+        create table if not exists samples (
+            id text primary key,
+            created_at text not null,
+            audio_path text not null,
+            audio_format text not null,
+            duration_seconds real,
+            audio_bytes integer not null,
+            raw_text text not null,
+            preview_text text not null,
+            corrected_text text not null,
+            model text,
+            language_mode text,
+            source text not null
+        )
+        """
+    )
+    conn.execute(
+        """
+        create table if not exists training_runs (
+            id text primary key,
+            created_at text not null,
+            status text not null,
+            log_path text,
+            model_path text
+        )
+        """
+    )
+    conn.execute(
+        """
+        create table if not exists promotions (
+            id integer primary key autoincrement,
+            created_at text not null,
+            model_path text not null,
+            previous_model_path text
+        )
+        """
+    )
+    conn.execute(
+        """
+        create table if not exists store_state (
+            key text primary key,
+            value text not null
+        )
+        """
+    )
+    conn.commit()
+
+
+def connect(root):
+    root.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(root / "index.sqlite")
+    ensure_schema(conn)
+    return conn
+
+
+def utc_now_iso():
+    return datetime.now(timezone.utc).isoformat()
+
+
+def date_from_created_at(created_at):
+    if isinstance(created_at, str) and len(created_at) >= 10:
+        date = created_at[:10]
+        if date[4:5] == "-" and date[7:8] == "-":
+            return date
+    return datetime.now().strftime("%Y-%m-%d")
+
+
+def sample_id(payload, audio_path):
+    created_at = str(payload.get("created_at") or utc_now_iso())
+    digest = hashlib.sha256()
+    digest.update(created_at.encode("utf-8"))
+    digest.update(str(audio_path).encode("utf-8"))
+    digest.update(str(payload.get("corrected_text", "")).encode("utf-8"))
+    suffix = digest.hexdigest()[:10]
+    safe_time = (
+        created_at.replace(":", "")
+        .replace("-", "")
+        .replace("+", "")
+        .replace(".", "")
+    )
+    safe_time = "".join(ch for ch in safe_time if ch.isalnum() or ch == "T")
+    return f"{safe_time[:22]}-{suffix}"
+
+
+def usage(conn):
+    row = conn.execute(
+        "select count(*), coalesce(sum(audio_bytes), 0) from samples"
+    ).fetchone()
+    return {"sample_count": int(row[0]), "audio_bytes": int(row[1])}
+
+
+def unlink_audio(root, relative_path):
+    path = root / relative_path
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        pass
+    except OSError:
+        pass
+
+
+def apply_retention(conn, root, max_storage_mb, max_samples):
+    max_bytes = max_storage_mb * 1024 * 1024
+    while True:
+        current = usage(conn)
+        over_samples = max_samples > 0 and current["sample_count"] > max_samples
+        over_bytes = max_bytes > 0 and current["audio_bytes"] > max_bytes
+        if not over_samples and not over_bytes:
+            return
+
+        row = conn.execute(
+            "select id, audio_path from samples order by created_at asc, id asc limit 1"
+        ).fetchone()
+        if not row:
+            return
+        sample, relative_path = row
+        unlink_audio(root, relative_path)
+        conn.execute("delete from samples where id = ?", (sample,))
+        conn.commit()
+
+
+def save_edited(payload):
+    settings = load_settings()
+    if not collection_enabled(settings):
+        return {"saved": False, "reason": "collection_disabled"}
+
+    source_path = Path(str(payload.get("audio_path") or ""))
+    corrected_text = str(payload.get("corrected_text") or "")
+    if not corrected_text.strip():
+        return {"saved": False, "reason": "empty_corrected_text"}
+    if not source_path.is_file():
+        return {"saved": False, "reason": "audio_missing"}
+
+    root = store_root()
+    conn = connect(root)
+    created_at = str(payload.get("created_at") or utc_now_iso())
+    sid = str(payload.get("id") or sample_id({**payload, "created_at": created_at}, source_path))
+    date_dir = date_from_created_at(created_at)
+    destination_dir = root / "audio" / date_dir
+    destination_dir.mkdir(parents=True, exist_ok=True)
+    relative_path = Path("audio") / date_dir / f"{sid}.wav"
+    destination = root / relative_path
+    if destination.exists():
+        suffix = hashlib.sha1(os.urandom(8)).hexdigest()[:6]
+        relative_path = Path("audio") / date_dir / f"{sid}-{suffix}.wav"
+        destination = root / relative_path
+
+    audio_bytes = source_path.stat().st_size
+    shutil.move(str(source_path), destination)
+
+    conn.execute(
+        """
+        insert into samples (
+            id, created_at, audio_path, audio_format, duration_seconds,
+            audio_bytes, raw_text, preview_text, corrected_text, model,
+            language_mode, source
+        ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            sid,
+            created_at,
+            relative_path.as_posix(),
+            str(payload.get("audio_format") or "wav_pcm_s16le_16000_mono"),
+            payload.get("duration_seconds"),
+            audio_bytes,
+            str(payload.get("raw_text") or ""),
+            str(payload.get("preview_text") or ""),
+            corrected_text,
+            str(payload.get("model") or ""),
+            str(payload.get("language_mode") or ""),
+            str(payload.get("source") or "voxpress-preview"),
+        ),
+    )
+    conn.commit()
+
+    max_storage_mb = int_setting(
+        settings,
+        "VOXPRESS_CORRECTION_MAX_STORAGE_MB",
+        "correction_max_storage_mb",
+        DEFAULT_MAX_STORAGE_MB,
+        low=1,
+    )
+    max_samples = int_setting(
+        settings,
+        "VOXPRESS_CORRECTION_MAX_SAMPLES",
+        "correction_max_samples",
+        DEFAULT_MAX_SAMPLES,
+        low=1,
+    )
+    apply_retention(conn, root, max_storage_mb, max_samples)
+    saved = destination.exists()
+    result = {
+        "saved": saved,
+        "id": sid,
+        "audio_path": relative_path.as_posix(),
+        **usage(conn),
+    }
+    conn.close()
+    return result
+
+
+def purge_store():
+    root = store_root()
+    conn = connect(root)
+    rows = conn.execute("select audio_path from samples").fetchall()
+    for (relative_path,) in rows:
+        unlink_audio(root, relative_path)
+    conn.execute("delete from samples")
+    conn.execute("delete from store_state")
+    conn.commit()
+    result = usage(conn)
+    conn.close()
+    return result
+
+
+def store_usage():
+    root = store_root()
+    conn = connect(root)
+    result = usage(conn)
+    conn.close()
+    return result
+
+
+def print_json(payload):
+    print(json.dumps(payload, ensure_ascii=False, sort_keys=True))
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    subparsers = parser.add_subparsers(dest="command", required=True)
+    subparsers.add_parser("save-edited")
+    subparsers.add_parser("usage")
+    purge = subparsers.add_parser("purge")
+    purge.add_argument("--yes", action="store_true")
+    args = parser.parse_args()
+
+    if args.command == "save-edited":
+        try:
+            payload = json.load(sys.stdin)
+        except json.JSONDecodeError as exc:
+            print_json({"saved": False, "reason": f"invalid_json: {exc}"})
+            return 2
+        print_json(save_edited(payload))
+        return 0
+
+    if args.command == "usage":
+        print_json(store_usage())
+        return 0
+
+    if args.command == "purge":
+        if not args.yes:
+            print("Refusing to purge without --yes", file=sys.stderr)
+            return 2
+        print_json(purge_store())
+        return 0
+
+    return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

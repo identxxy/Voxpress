@@ -4,6 +4,7 @@ import fcntl
 import json
 import os
 import re
+import shutil
 import socket
 import subprocess
 import sys
@@ -19,13 +20,19 @@ gi.require_version("GdkX11", "3.0")
 from gi.repository import Gdk, GdkX11, GLib, Gtk
 
 
+def resolve_xdotool():
+    configured = os.environ.get("VOXTYPE_XDOTOOL") or os.environ.get("VOXPRESS_XDOTOOL")
+    if configured:
+        return configured
+    bundled = os.path.expanduser("~/.local/share/voxtype/xdotool-env/bin/xdotool")
+    return shutil.which("xdotool") or (bundled if os.path.isfile(bundled) else "xdotool")
+
+
 RUNTIME_DIR = os.environ.get("XDG_RUNTIME_DIR", f"/tmp/voxtype-{os.getuid()}")
 STATE_DIR = os.path.join(RUNTIME_DIR, "voxtype")
 SOCKET_PATH = os.path.join(STATE_DIR, "popup-ui.sock")
 LOCK_PATH = os.path.join(STATE_DIR, "popup-ui-start.lock")
-XDOTOOL = os.environ.get(
-    "VOXTYPE_XDOTOOL", os.environ.get("VOXPRESS_XDOTOOL", "xdotool")
-)
+XDOTOOL = resolve_xdotool()
 STATUS_WIDTH = int(os.environ.get("VOXTYPE_STATUS_WIDTH", "440"))
 STATUS_HEIGHT = int(os.environ.get("VOXTYPE_STATUS_HEIGHT", "82"))
 PREVIEW_WIDTH = int(os.environ.get("VOXTYPE_PREVIEW_WIDTH", "720"))
@@ -96,6 +103,16 @@ KEY_ALIASES = {
 }
 
 KEY_SETTINGS = {"trigger_key", "confirm_key", "cancel_key"}
+DAEMON_PROTOCOL = "voxpress-popup-ui/v3"
+DAEMON_COMMANDS = [
+    "capabilities",
+    "recording",
+    "transcribing",
+    "saved-correction",
+    "preview",
+    "hide",
+    "ping",
+]
 
 
 def clamp(value, low, high):
@@ -261,21 +278,29 @@ def socket_request(message, wait_response=True, stdin_text=None):
 def ensure_daemon():
     os.makedirs(STATE_DIR, exist_ok=True)
 
-    def can_connect():
+    def can_connect_current_daemon():
         try:
             with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
                 client.settimeout(0.2)
                 client.connect(SOCKET_PATH)
-                return True
-        except OSError:
+                client.sendall(b'{"cmd": "capabilities"}\n')
+                with client.makefile("r", encoding="utf-8") as stream:
+                    line = stream.readline()
+                response = json.loads(line) if line else {}
+        except (OSError, json.JSONDecodeError):
             return False
+        return (
+            response.get("ok") is True
+            and response.get("protocol") == DAEMON_PROTOCOL
+            and "saved-correction" in response.get("commands", [])
+        )
 
-    if can_connect():
+    if can_connect_current_daemon():
         return
 
     with open(LOCK_PATH, "w", encoding="utf-8") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
-        if not can_connect():
+        if not can_connect_current_daemon():
             subprocess.Popen(
                 [sys.argv[0], "daemon"],
                 stdout=subprocess.DEVNULL,
@@ -284,7 +309,7 @@ def ensure_daemon():
             )
         deadline = time.monotonic() + 3
         while time.monotonic() < deadline:
-            if can_connect():
+            if can_connect_current_daemon():
                 return
             time.sleep(0.05)
 
@@ -492,12 +517,18 @@ class StatusWindow:
         self.window.show_all()
         set_pointer_passthrough(self.window)
 
-    def show(self, title, reference_window=None):
+    def show(self, title, reference_window=None, auto_hide_ms=None):
         self.reload_settings()
         self.reference_window = reference_window or self.reference_window
         self.reveal_token += 1
         token = self.reveal_token
-        dot_color = "#f87171" if title.lower().startswith("recording") else "#38bdf8"
+        lower_title = title.lower()
+        if lower_title.startswith("recording"):
+            dot_color = "#f87171"
+        elif lower_title.startswith("saved"):
+            dot_color = "#22c55e"
+        else:
+            dot_color = "#38bdf8"
         self.label.set_markup(
             f'<span foreground="{dot_color}">●</span> {GLib.markup_escape_text(title)}'
         )
@@ -512,6 +543,13 @@ class StatusWindow:
         GLib.idle_add(self.reposition_hidden, token)
         GLib.timeout_add(35, self.reposition_hidden, token)
         GLib.timeout_add(70, self.reveal, token)
+        if auto_hide_ms:
+            GLib.timeout_add(auto_hide_ms, self.hide_if_token, token)
+        return False
+
+    def hide_if_token(self, token):
+        if token == self.reveal_token:
+            self.hide()
         return False
 
     def reposition_hidden(self, token):
@@ -775,10 +813,10 @@ class PopupDaemon:
         self.status = StatusWindow()
         self.preview = PreviewWindow()
 
-    def show_status(self, title, reference_window=None):
+    def show_status(self, title, reference_window=None, auto_hide_ms=None):
         self.reference_window = reference_window or self.reference_window
         self.preview.cancel_if_pending()
-        self.status.show(title, self.reference_window)
+        self.status.show(title, self.reference_window, auto_hide_ms)
         return False
 
     def show_preview(self, text, conn, reference_window=None):
@@ -833,12 +871,24 @@ def handle_client(ui, conn):
         command = message.get("cmd")
         reference_window = message.get("reference_window")
 
-        if command == "recording":
+        if command == "capabilities":
+            payload = {
+                "ok": True,
+                "protocol": DAEMON_PROTOCOL,
+                "commands": DAEMON_COMMANDS,
+            }
+            conn.sendall((json.dumps(payload) + "\n").encode("utf-8"))
+            conn.close()
+        elif command == "recording":
             GLib.idle_add(ui.show_status, "Recording", reference_window)
             conn.sendall(b'{"ok": true}\n')
             conn.close()
         elif command == "transcribing":
             GLib.idle_add(ui.show_status, "Transcribing", reference_window)
+            conn.sendall(b'{"ok": true}\n')
+            conn.close()
+        elif command == "saved-correction":
+            GLib.idle_add(ui.show_status, "Saved correction", reference_window, 1300)
             conn.sendall(b'{"ok": true}\n')
             conn.close()
         elif command == "preview":
@@ -871,7 +921,10 @@ def run_daemon():
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("command", choices=["daemon", "recording", "transcribing", "preview", "hide", "ping"])
+    parser.add_argument(
+        "command",
+        choices=["daemon", "recording", "transcribing", "saved-correction", "preview", "hide", "ping"],
+    )
     parser.add_argument("--reference-window")
     args = parser.parse_args()
 

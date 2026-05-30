@@ -1,22 +1,39 @@
 #!/usr/bin/env python3
 import os
 import json
+import shutil
 import subprocess
 import sys
+from datetime import datetime
+from pathlib import Path
 
-from opencc import OpenCC
+try:
+    from opencc import OpenCC
+except ModuleNotFoundError:
+    OpenCC = None
 
 
-XDOTOOL = os.environ.get(
-    "VOXTYPE_XDOTOOL", os.environ.get("VOXPRESS_XDOTOOL", "xdotool")
-)
+def resolve_xdotool():
+    configured = os.environ.get("VOXTYPE_XDOTOOL") or os.environ.get("VOXPRESS_XDOTOOL")
+    if configured:
+        return configured
+    bundled = os.path.expanduser("~/.local/share/voxtype/xdotool-env/bin/xdotool")
+    return shutil.which("xdotool") or (bundled if os.path.isfile(bundled) else "xdotool")
+
+
+XDOTOOL = resolve_xdotool()
 POPUP_UI = os.environ.get(
     "VOXTYPE_POPUP_UI", os.path.expanduser("~/.local/bin/voxpress-popup-ui")
+)
+CORRECTION_STORE = os.environ.get(
+    "VOXPRESS_CORRECTION_STORE", os.path.expanduser("~/.local/bin/voxpress-correction-store")
 )
 RUNTIME_DIR = os.environ.get("XDG_RUNTIME_DIR", f"/tmp/voxtype-{os.getuid()}")
 STATE_DIR = os.path.join(RUNTIME_DIR, "voxtype")
 TARGET_WINDOW_FILE = os.path.join(STATE_DIR, "target_window")
 EXPECTED_PASTE_FILE = os.path.join(STATE_DIR, "expected_paste_text")
+CORRECTION_AUDIO_FILE = os.path.join(STATE_DIR, "correction_audio_path")
+CORRECTION_AUDIO_DURATION_FILE = os.path.join(STATE_DIR, "correction_audio_duration")
 CONFIG_PATH = os.environ.get(
     "VOXTYPE_POPUP_SETTINGS",
     os.environ.get("VOXPRESS_SETTINGS", os.path.expanduser("~/.config/voxpress/settings.json")),
@@ -38,18 +55,192 @@ def should_append_newline() -> bool:
     override = bool_from_env(os.environ.get("VOXTYPE_APPEND_NEWLINE"))
     if override is not None:
         return override
+    settings = load_settings()
+    return bool(settings.get("append_newline", True))
+
+
+def load_settings() -> dict:
     try:
         with open(CONFIG_PATH, "r", encoding="utf-8") as handle:
-            settings = json.load(handle)
+            raw = json.load(handle)
     except (OSError, json.JSONDecodeError):
-        return True
-    return bool(settings.get("append_newline", True))
+        return {}
+    return raw if isinstance(raw, dict) else {}
 
 
 def append_output_newline(text: str) -> str:
     if not text or not should_append_newline():
         return text
     return text if text.endswith("\n") else f"{text}\n"
+
+
+def convert_t2s_with_python(text: str) -> str | None:
+    candidates = [
+        os.environ.get("VOXPRESS_OPENCC_PYTHON"),
+        os.path.expanduser("~/.local/share/voxtype/postprocess-env/bin/python"),
+    ]
+    code = (
+        "import sys\n"
+        "from opencc import OpenCC\n"
+        "sys.stdout.write(OpenCC('t2s').convert(sys.stdin.read()))\n"
+    )
+    for candidate in candidates:
+        if not candidate or not Path(candidate).is_file():
+            continue
+        try:
+            result = subprocess.run(
+                [candidate, "-c", code],
+                input=text,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                text=True,
+                timeout=5,
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            continue
+        if result.returncode == 0:
+            return result.stdout
+    return None
+
+
+def convert_t2s(text: str) -> str:
+    if OpenCC is not None:
+        return OpenCC("t2s").convert(text)
+    converted = convert_t2s_with_python(text)
+    return text if converted is None else converted
+
+
+def normalize_correction_text(text: str) -> str:
+    return text.rstrip("\n")
+
+
+def preview_was_edited(preview_text: str, corrected_text: str) -> bool:
+    return normalize_correction_text(preview_text) != normalize_correction_text(corrected_text)
+
+
+def correction_collection_enabled() -> bool:
+    override = bool_from_env(os.environ.get("VOXPRESS_CORRECTION_COLLECTION"))
+    if override is not None:
+        return override
+    settings = load_settings()
+    return bool(settings.get("correction_collection_enabled", True))
+
+
+def maybe_float(value: str | None):
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except ValueError:
+        return None
+
+
+def read_text_file(path: str) -> str | None:
+    try:
+        with open(path, encoding="utf-8") as handle:
+            value = handle.read().strip()
+    except OSError:
+        return None
+    return value or None
+
+
+def clear_correction_audio_state() -> None:
+    for path in (CORRECTION_AUDIO_FILE, CORRECTION_AUDIO_DURATION_FILE):
+        try:
+            os.unlink(path)
+        except FileNotFoundError:
+            pass
+        except OSError:
+            pass
+
+
+def managed_audio_path(audio_path: str | None) -> bool:
+    if not audio_path:
+        return False
+    try:
+        return Path(audio_path).resolve().is_relative_to(Path(STATE_DIR).resolve())
+    except OSError:
+        return False
+
+
+def remove_audio_if_managed(audio_path: str | None, from_state: bool = False) -> None:
+    if not from_state and not managed_audio_path(audio_path):
+        return
+    try:
+        Path(audio_path).unlink()
+    except FileNotFoundError:
+        pass
+    except OSError:
+        pass
+
+
+def current_audio_path() -> str | None:
+    return os.environ.get("VOXTYPE_AUDIO_PATH") or read_text_file(CORRECTION_AUDIO_FILE)
+
+
+def audio_path_from_state() -> bool:
+    return not os.environ.get("VOXTYPE_AUDIO_PATH") and bool(read_text_file(CORRECTION_AUDIO_FILE))
+
+
+def current_audio_duration() -> float | None:
+    return maybe_float(
+        os.environ.get("VOXTYPE_AUDIO_DURATION_SECONDS")
+        or read_text_file(CORRECTION_AUDIO_DURATION_FILE)
+    )
+
+
+def maybe_save_correction_sample(raw_text: str, preview_text: str, corrected_text: str) -> bool:
+    audio_path = current_audio_path()
+    from_state = audio_path_from_state()
+    saved = False
+    if not correction_collection_enabled():
+        remove_audio_if_managed(audio_path, from_state)
+        clear_correction_audio_state()
+        return False
+    if not corrected_text.strip() or not preview_was_edited(preview_text, corrected_text):
+        remove_audio_if_managed(audio_path, from_state)
+        clear_correction_audio_state()
+        return False
+    if not audio_path or not Path(audio_path).is_file():
+        clear_correction_audio_state()
+        return False
+
+    settings = load_settings()
+    payload = {
+        "audio_path": audio_path,
+        "created_at": datetime.now().astimezone().isoformat(),
+        "duration_seconds": current_audio_duration(),
+        "raw_text": raw_text,
+        "preview_text": preview_text,
+        "corrected_text": corrected_text,
+        "model": os.environ.get("VOXTYPE_MODEL", ""),
+        "language_mode": settings.get("language_mode", ""),
+        "source": "voxpress-preview",
+    }
+
+    try:
+        result = subprocess.run(
+            [CORRECTION_STORE, "save-edited"],
+            input=json.dumps(payload, ensure_ascii=False),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+        if result.returncode == 0:
+            try:
+                saved = bool(json.loads(result.stdout).get("saved"))
+            except json.JSONDecodeError:
+                saved = False
+    except (OSError, subprocess.TimeoutExpired):
+        saved = False
+
+    if not saved:
+        remove_audio_if_managed(audio_path, from_state)
+    clear_correction_audio_state()
+    return saved
 
 
 def get_active_window() -> str | None:
@@ -176,10 +367,29 @@ def notify_preview(text: str) -> None:
         pass
 
 
+def notify_saved_correction() -> None:
+    target_window = get_target_window() or get_active_window()
+    cmd = [POPUP_UI, "saved-correction"]
+    if target_window:
+        cmd.extend(["--reference-window", target_window])
+    try:
+        subprocess.run(
+            cmd,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=2,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+
+
 def main() -> int:
     text = sys.stdin.read()
-    converted = OpenCC("t2s").convert(text)
+    converted = convert_t2s(text)
     final_text = edit_preview(converted).strip()
+    if maybe_save_correction_sample(text, converted, final_text):
+        notify_saved_correction()
     final_text = append_output_newline(final_text)
     write_expected_paste(final_text)
     sys.stdout.write(final_text)

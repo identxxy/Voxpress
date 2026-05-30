@@ -2,10 +2,14 @@
 import json
 import os
 import re
+import shlex
+import shutil
 import signal
 import subprocess
 import sys
 import time
+import uuid
+from pathlib import Path
 
 
 CONFIG_PATH = os.environ.get(
@@ -15,9 +19,6 @@ CONFIG_PATH = os.environ.get(
 DEFAULT_TRIGGER_KEY = os.environ.get("VOXTYPE_TRIGGER_KEY", "Pause")
 KEYCODE_OVERRIDE = os.environ.get("VOXTYPE_PAUSE_KEYCODE")
 VOXTYPE = os.environ.get("VOXTYPE_BIN", "voxtype")
-XDOTOOL = os.environ.get(
-    "VOXTYPE_XDOTOOL", os.environ.get("VOXPRESS_XDOTOOL", "xdotool")
-)
 POPUP_UI = os.environ.get(
     "VOXTYPE_POPUP_UI", os.path.expanduser("~/.local/bin/voxpress-popup-ui")
 )
@@ -25,12 +26,18 @@ RUNTIME_DIR = os.environ.get("XDG_RUNTIME_DIR", f"/tmp/voxtype-{os.getuid()}")
 STATE_DIR = os.path.join(RUNTIME_DIR, "voxtype")
 TARGET_WINDOW_FILE = os.path.join(STATE_DIR, "target_window")
 EXPECTED_PASTE_FILE = os.path.join(STATE_DIR, "expected_paste_text")
+CORRECTION_AUDIO_FILE = os.path.join(STATE_DIR, "correction_audio_path")
+CORRECTION_AUDIO_DURATION_FILE = os.path.join(STATE_DIR, "correction_audio_duration")
+AUDIO_CAPTURE_DIR = os.path.join(STATE_DIR, "correction-audio")
 DRY_RUN = os.environ.get("VOXTYPE_PAUSE_DRY_RUN", "0") == "1"
 MIN_RECORDING_MS = int(os.environ.get("VOXTYPE_MIN_RECORDING_MS", "650"))
 
 recording = False
 target_window = None
 recording_started_at = 0.0
+audio_capture_proc = None
+audio_capture_path = None
+audio_capture_started_at = 0.0
 trigger_key = DEFAULT_TRIGGER_KEY
 trigger_keycodes = {KEYCODE_OVERRIDE} if KEYCODE_OVERRIDE else set()
 settings_mtime = None
@@ -80,6 +87,17 @@ def log(message: str) -> None:
     print(message, flush=True)
 
 
+def resolve_xdotool():
+    configured = os.environ.get("VOXTYPE_XDOTOOL") or os.environ.get("VOXPRESS_XDOTOOL")
+    if configured:
+        return configured
+    bundled = os.path.expanduser("~/.local/share/voxtype/xdotool-env/bin/xdotool")
+    return shutil.which("xdotool") or (bundled if os.path.isfile(bundled) else "xdotool")
+
+
+XDOTOOL = resolve_xdotool()
+
+
 def normalize_key_name(value: str | None, default: str = DEFAULT_TRIGGER_KEY) -> str:
     value = str(value or default)
     value = KEY_ALIASES.get(value, value)
@@ -101,6 +119,33 @@ def load_trigger_key() -> str:
     except (OSError, json.JSONDecodeError):
         return DEFAULT_TRIGGER_KEY
     return normalize_key_name(settings.get("trigger_key"), DEFAULT_TRIGGER_KEY)
+
+
+def load_settings() -> dict:
+    try:
+        with open(CONFIG_PATH, "r", encoding="utf-8") as handle:
+            raw = json.load(handle)
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return raw if isinstance(raw, dict) else {}
+
+
+def bool_from_env(value: str | None) -> bool | None:
+    if value is None:
+        return None
+    normalized = value.strip().lower()
+    if normalized in ("1", "true", "yes", "on"):
+        return True
+    if normalized in ("0", "false", "no", "off"):
+        return False
+    return None
+
+
+def correction_collection_enabled() -> bool:
+    override = bool_from_env(os.environ.get("VOXPRESS_CORRECTION_COLLECTION"))
+    if override is not None:
+        return override
+    return bool(load_settings().get("correction_collection_enabled", True))
 
 
 def keycodes_for_key_name(key_name: str) -> set[str]:
@@ -206,6 +251,133 @@ def clear_expected_paste() -> None:
         pass
 
 
+def clear_pending_correction_audio(unlink_audio: bool = False) -> None:
+    audio_path = None
+    try:
+        with open(CORRECTION_AUDIO_FILE, encoding="utf-8") as handle:
+            audio_path = handle.read().strip()
+    except OSError:
+        audio_path = None
+
+    for path in (CORRECTION_AUDIO_FILE, CORRECTION_AUDIO_DURATION_FILE):
+        try:
+            os.unlink(path)
+        except FileNotFoundError:
+            pass
+        except OSError:
+            pass
+
+    if unlink_audio and audio_path:
+        try:
+            Path(audio_path).unlink()
+        except FileNotFoundError:
+            pass
+        except OSError:
+            pass
+
+
+def audio_capture_command(path: str) -> list[str]:
+    template = os.environ.get("VOXPRESS_AUDIO_CAPTURE_CMD")
+    if template:
+        return shlex.split(template.format(path=path))
+
+    device = os.environ.get("VOXPRESS_AUDIO_DEVICE", "@DEFAULT_SOURCE@")
+    return [
+        "parec",
+        "--record",
+        "--file-format=wav",
+        "--format=s16le",
+        "--rate=16000",
+        "--channels=1",
+        f"--device={device}",
+        path,
+    ]
+
+
+def start_correction_audio_capture() -> bool:
+    global audio_capture_proc, audio_capture_path, audio_capture_started_at
+    if not correction_collection_enabled():
+        return False
+    if DRY_RUN:
+        return False
+    if audio_capture_proc is not None:
+        return False
+
+    clear_pending_correction_audio(unlink_audio=True)
+    try:
+        os.makedirs(AUDIO_CAPTURE_DIR, exist_ok=True)
+    except OSError:
+        return False
+
+    audio_capture_path = os.path.join(AUDIO_CAPTURE_DIR, f"{uuid.uuid4().hex}.wav")
+    cmd = audio_capture_command(audio_capture_path)
+    try:
+        audio_capture_proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+    except OSError as exc:
+        log(f"correction audio capture failed to start: {exc}")
+        audio_capture_proc = None
+        audio_capture_path = None
+        return False
+
+    audio_capture_started_at = time.monotonic()
+    return True
+
+
+def stop_correction_audio_capture(keep: bool) -> None:
+    global audio_capture_proc, audio_capture_path, audio_capture_started_at
+    proc = audio_capture_proc
+    path = audio_capture_path
+    started_at = audio_capture_started_at
+    audio_capture_proc = None
+    audio_capture_path = None
+    audio_capture_started_at = 0.0
+
+    if proc is not None:
+        proc.terminate()
+        try:
+            proc.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            try:
+                proc.wait(timeout=1)
+            except subprocess.TimeoutExpired:
+                pass
+
+    if not path:
+        clear_pending_correction_audio(unlink_audio=not keep)
+        return
+
+    size = 0
+    try:
+        size = os.path.getsize(path)
+    except OSError:
+        size = 0
+
+    if keep and size > 44:
+        try:
+            os.makedirs(STATE_DIR, exist_ok=True)
+            with open(CORRECTION_AUDIO_FILE, "w", encoding="utf-8") as handle:
+                handle.write(path)
+            with open(CORRECTION_AUDIO_DURATION_FILE, "w", encoding="utf-8") as handle:
+                handle.write(f"{max(0.0, time.monotonic() - started_at):.3f}")
+            return
+        except OSError:
+            pass
+
+    try:
+        os.unlink(path)
+    except FileNotFoundError:
+        pass
+    except OSError:
+        pass
+    clear_pending_correction_audio(unlink_audio=False)
+
+
 def get_active_window() -> str | None:
     try:
         result = subprocess.run(
@@ -268,6 +440,7 @@ def start_recording() -> None:
     target_window = get_active_window()
     save_target_window(target_window)
     clear_expected_paste()
+    start_correction_audio_capture()
     log(f"{key_label(trigger_key)} pressed: start recording")
     popup("recording", target_window)
     run_voxtype("start")
@@ -283,11 +456,13 @@ def stop_recording() -> None:
         log(f"{key_label(trigger_key)} released after {duration_ms}ms: cancel short recording")
         popup("hide", target_window)
         clear_expected_paste()
+        stop_correction_audio_capture(keep=False)
         run_voxtype("cancel")
         return
 
     log(f"{key_label(trigger_key)} released: stop recording")
     popup("transcribing", target_window)
+    stop_correction_audio_capture(keep=True)
     run_voxtype("stop")
 
 
@@ -295,6 +470,7 @@ def cancel_recording() -> None:
     global recording
     popup("hide", target_window)
     clear_expected_paste()
+    stop_correction_audio_capture(keep=False)
     if recording:
         recording = False
         run_voxtype("cancel")

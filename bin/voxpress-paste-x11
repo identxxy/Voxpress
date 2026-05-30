@@ -8,6 +8,7 @@ STATE_DIR="${XDG_RUNTIME_DIR:-/tmp}/voxtype"
 EXPECTED_PASTE="$STATE_DIR/expected_paste_text"
 SAVED_CLIPBOARD="$STATE_DIR/saved_clipboard"
 SAVED_STATE="$STATE_DIR/saved_clipboard_state"
+POPUP_UI="${VOXTYPE_POPUP_UI:-$HOME/.local/bin/voxpress-popup-ui}"
 CLIPBOARD_NOW="$(mktemp)"
 EXPECTED_TRIMMED="$(mktemp)"
 
@@ -31,7 +32,18 @@ restore_clipboard() {
   esac
 }
 
+hide_popup() {
+  "$POPUP_UI" hide >/dev/null 2>&1 || true
+}
+
+exit_without_paste() {
+  restore_clipboard
+  hide_popup
+  exit 0
+}
+
 if [[ ! -f "$EXPECTED_PASTE" ]]; then
+  hide_popup
   exit 0
 fi
 
@@ -40,13 +52,11 @@ EXPECTED_MTIME="$(stat -c %Y "$EXPECTED_PASTE" 2>/dev/null || printf '0')"
 EXPECTED_MAX_AGE="${VOXTYPE_EXPECTED_PASTE_MAX_AGE:-20}"
 if (( NOW - EXPECTED_MTIME > EXPECTED_MAX_AGE )); then
   rm -f "$EXPECTED_PASTE"
-  restore_clipboard
-  exit 0
+  exit_without_paste
 fi
 
 if ! /usr/bin/xclip -selection clipboard -o >"$CLIPBOARD_NOW" 2>/dev/null; then
-  restore_clipboard
-  exit 0
+  exit_without_paste
 fi
 
 MATCH_MODE=exact
@@ -62,12 +72,21 @@ PY
   if cmp -s "$EXPECTED_TRIMMED" "$CLIPBOARD_NOW"; then
     MATCH_MODE=restore-trailing-newline
   else
-    restore_clipboard
-    exit 0
+    exit_without_paste
   fi
 fi
 
-XDOTOOL="${VOXTYPE_XDOTOOL:-${VOXPRESS_XDOTOOL:-xdotool}}"
+if [[ -n "${VOXTYPE_XDOTOOL:-}" ]]; then
+  XDOTOOL="$VOXTYPE_XDOTOOL"
+elif [[ -n "${VOXPRESS_XDOTOOL:-}" ]]; then
+  XDOTOOL="$VOXPRESS_XDOTOOL"
+elif command -v xdotool >/dev/null 2>&1; then
+  XDOTOOL="$(command -v xdotool)"
+elif [[ -x "$HOME/.local/share/voxtype/xdotool-env/bin/xdotool" ]]; then
+  XDOTOOL="$HOME/.local/share/voxtype/xdotool-env/bin/xdotool"
+else
+  XDOTOOL="xdotool"
+fi
 WINDOW_CLASS="$("$XDOTOOL" getactivewindow getwindowclassname 2>/dev/null || true)"
 
 case "${WINDOW_CLASS,,}" in
@@ -82,8 +101,7 @@ esac
 if [[ "${VOXTYPE_PASTE_DRY_RUN:-0}" == "1" ]]; then
   printf 'paste_keys=%s window_class=%s match_mode=%s\n' "$PASTE_KEYS" "$WINDOW_CLASS" "$MATCH_MODE"
   rm -f "$EXPECTED_PASTE"
-  restore_clipboard
-  exit 0
+  exit_without_paste
 fi
 
 if [[ "$MATCH_MODE" == "restore-trailing-newline" ]]; then
@@ -93,6 +111,9 @@ fi
 
 rm -f "$EXPECTED_PASTE"
 
-"$XDOTOOL" key --clearmodifiers "$PASTE_KEYS"
+if ! "$XDOTOOL" key --clearmodifiers "$PASTE_KEYS"; then
+  exit_without_paste
+fi
 sleep "${VOXTYPE_RESTORE_CLIPBOARD_DELAY:-0.45}"
 restore_clipboard
+hide_popup

@@ -1,0 +1,307 @@
+#!/usr/bin/env python3
+import argparse
+import json
+import os
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+
+os.environ.setdefault("HF_HUB_DISABLE_XET", "1")
+
+
+def load_manifest(path):
+    with open(path, "r", encoding="utf-8") as handle:
+        return json.load(handle)
+
+
+def write_result(output_dir, payload):
+    output_dir.mkdir(parents=True, exist_ok=True)
+    (output_dir / "train-result.json").write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+
+
+def run_dry(args):
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    deploy_model = os.environ.get("VOXPRESS_DRY_RUN_DEPLOY_MODEL")
+    if deploy_model:
+        Path(deploy_model).parent.mkdir(parents=True, exist_ok=True)
+        Path(deploy_model).write_text(
+            json.dumps(
+                {
+                    "deploy_type": "voxpress-whisper-cli-wrapper",
+                    "base_model": "dry-run",
+                    "adapter_dir": "dry-run",
+                    "processor_dir": "dry-run",
+                }
+            ),
+            encoding="utf-8",
+        )
+    write_result(
+        output_dir,
+        {
+            "status": "dry_run",
+            "deploy_model_path": deploy_model,
+            "deploy_ready": bool(deploy_model),
+            "deploy_reason": "dry_run_deploy_model" if deploy_model else "dry_run_no_deploy_model",
+            "sample_count": load_manifest(args.manifest).get("sample_count", 0),
+        },
+    )
+    return 0
+
+
+def require_training_dependencies():
+    missing = []
+    for module in ("torch", "transformers", "peft", "soundfile"):
+        try:
+            __import__(module)
+        except ImportError:
+            missing.append(module)
+    if missing:
+        print(
+            "Missing training dependencies: " + ", ".join(missing),
+            file=sys.stderr,
+        )
+        return False
+    return True
+
+
+def export_timeout_seconds():
+    raw = os.environ.get("VOXPRESS_EXPORT_TIMEOUT_SECONDS")
+    if raw is None:
+        return None
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        return None
+    if value <= 0:
+        return None
+    return value
+
+
+def sample_presentation_limit(sample_count, max_epochs):
+    if max_epochs is None or max_epochs <= 0:
+        return None
+    return max(1, sample_count) * max(1, max_epochs)
+
+
+def run_real(args):
+    if not require_training_dependencies():
+        return 2
+
+    import torch
+    import soundfile as sf
+    from peft import LoraConfig, get_peft_model
+    from transformers import (
+        WhisperForConditionalGeneration,
+        WhisperProcessor,
+    )
+
+    manifest = load_manifest(args.manifest)
+    samples = manifest.get("samples", [])
+    if not samples:
+        print("No samples in manifest", file=sys.stderr)
+        return 1
+
+    model_name = args.base_model
+    processor = WhisperProcessor.from_pretrained(model_name, language=args.language, task="transcribe")
+    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+    dtype = torch.float32
+    model = WhisperForConditionalGeneration.from_pretrained(model_name, torch_dtype=dtype)
+    model.config.forced_decoder_ids = None
+    model.config.suppress_tokens = []
+    model.config.use_cache = False
+
+    lora = LoraConfig(
+        r=args.lora_rank,
+        lora_alpha=args.lora_alpha,
+        target_modules=["q_proj", "v_proj"],
+        lora_dropout=0.05,
+        bias="none",
+    )
+    model = get_peft_model(model, lora)
+    for parameter in model.parameters():
+        if parameter.requires_grad:
+            parameter.data = parameter.data.float()
+    model.to(device)
+
+    def prepare(sample):
+        audio_array, sampling_rate = sf.read(sample["audio_path"], dtype="float32")
+        if getattr(audio_array, "ndim", 1) > 1:
+            audio_array = audio_array.mean(axis=1)
+        if sampling_rate != 16000:
+            raise ValueError(f"Expected 16 kHz correction WAV, got {sampling_rate} Hz")
+        input_features = processor.feature_extractor(
+            audio_array, sampling_rate=sampling_rate
+        ).input_features[0]
+        labels = processor.tokenizer(sample["text"]).input_ids
+        return {"input_features": input_features, "labels": labels}
+
+    prepared = [prepare(sample) for sample in samples]
+
+    def collate(features):
+        input_features = [{"input_features": feature["input_features"]} for feature in features]
+        label_features = [{"input_ids": feature["labels"]} for feature in features]
+        batch = processor.feature_extractor.pad(input_features, return_tensors="pt")
+        labels_batch = processor.tokenizer.pad(label_features, return_tensors="pt")
+        labels = labels_batch["input_ids"].masked_fill(labels_batch.attention_mask.ne(1), -100)
+        batch["labels"] = labels
+        return batch
+
+    output_dir = Path(args.output_dir)
+    optimizer = torch.optim.AdamW(
+        [parameter for parameter in model.parameters() if parameter.requires_grad],
+        lr=args.learning_rate,
+    )
+    model.train()
+    sample_index = 0
+    samples_seen = 0
+    sample_limit = sample_presentation_limit(len(prepared), args.max_epochs)
+    train_deadline = time.monotonic() + max(1, args.max_minutes) * 60
+    for step in range(args.max_steps):
+        if sample_limit is not None and samples_seen >= sample_limit:
+            print(f"Stopping training at max_epochs={args.max_epochs}", flush=True)
+            break
+        if step > 0 and time.monotonic() >= train_deadline:
+            print(f"Stopping training at max_minutes={args.max_minutes}", flush=True)
+            break
+        optimizer.zero_grad(set_to_none=True)
+        total_loss = 0.0
+        accumulated = 0
+        for _ in range(max(1, args.gradient_accumulation_steps)):
+            if sample_limit is not None and samples_seen >= sample_limit:
+                break
+            batch_items = []
+            for _batch_index in range(max(1, args.batch_size)):
+                if sample_limit is not None and samples_seen >= sample_limit:
+                    break
+                batch_items.append(prepared[sample_index % len(prepared)])
+                sample_index += 1
+                samples_seen += 1
+            if not batch_items:
+                break
+            batch = collate(batch_items)
+            batch = {
+                key: value.to(device)
+                for key, value in batch.items()
+            }
+            batch["input_features"] = batch["input_features"].to(dtype=dtype)
+            loss = model(**batch).loss / max(1, args.gradient_accumulation_steps)
+            if not torch.isfinite(loss):
+                raise RuntimeError(f"Non-finite training loss at step {step + 1}: {loss}")
+            loss.backward()
+            total_loss += float(loss.detach().cpu()) * max(1, args.gradient_accumulation_steps)
+            accumulated += 1
+        if accumulated == 0:
+            break
+        torch.nn.utils.clip_grad_norm_(
+            [parameter for parameter in model.parameters() if parameter.requires_grad],
+            max_norm=1.0,
+        )
+        optimizer.step()
+        for name, parameter in model.named_parameters():
+            if parameter.requires_grad and not torch.isfinite(parameter).all():
+                raise RuntimeError(f"Non-finite trainable parameter after step {step + 1}: {name}")
+        print(f"step={step + 1} loss={total_loss:.6f} samples_seen={samples_seen}", flush=True)
+
+    adapter_dir = output_dir / "adapter"
+    model.save_pretrained(adapter_dir)
+    processor.save_pretrained(output_dir / "processor")
+
+    export_result = run_exporter(
+        args,
+        adapter_dir=adapter_dir,
+        processor_dir=output_dir / "processor",
+        output_dir=output_dir / "deploy",
+    )
+    deploy_model_path = export_result.get("deploy_model_path")
+
+    write_result(
+        output_dir,
+        {
+            "status": "trained",
+            "adapter_dir": str(adapter_dir),
+            "deploy_model_path": deploy_model_path,
+            "deploy_ready": bool(deploy_model_path),
+            "deploy_reason": export_result.get("reason", export_result.get("status")),
+            "export_result": export_result,
+            "max_epochs": args.max_epochs,
+            "sample_count": len(samples),
+        },
+    )
+    return 0
+
+
+def run_exporter(args, adapter_dir, processor_dir, output_dir):
+    script = Path(__file__).resolve().with_name("voxpress-export-whisper-deploy")
+    cmd = [
+        sys.executable,
+        str(script),
+        "--base-model",
+        args.base_model,
+        "--adapter-dir",
+        str(adapter_dir),
+        "--processor-dir",
+        str(processor_dir),
+        "--output-dir",
+        str(output_dir),
+    ]
+    try:
+        result = subprocess.run(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=export_timeout_seconds(),
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return {"status": "export_failed", "reason": f"export_spawn_failed: {exc}", "deploy_model_path": None}
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    (output_dir / "export.stdout.log").write_text(result.stdout, encoding="utf-8")
+    (output_dir / "export.stderr.log").write_text(result.stderr, encoding="utf-8")
+    if result.returncode != 0:
+        return {"status": "export_failed", "reason": "export_command_failed", "deploy_model_path": None}
+    try:
+        payload = json.loads(result.stdout)
+    except json.JSONDecodeError:
+        return {"status": "export_failed", "reason": "export_output_invalid", "deploy_model_path": None}
+    if not isinstance(payload, dict):
+        return {"status": "export_failed", "reason": "export_output_invalid", "deploy_model_path": None}
+    return payload
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--manifest")
+    parser.add_argument("--output-dir")
+    parser.add_argument("--max-minutes", type=int, default=30)
+    parser.add_argument("--max-epochs", type=int, default=int(os.environ.get("VOXPRESS_TRAIN_MAX_EPOCHS", "5")))
+    parser.add_argument("--base-model", default=os.environ.get("VOXPRESS_BASE_WHISPER_MODEL", "openai/whisper-large-v3-turbo"))
+    parser.add_argument("--language", default=os.environ.get("VOXPRESS_TRAIN_LANGUAGE", "zh"))
+    parser.add_argument("--max-steps", type=int, default=int(os.environ.get("VOXPRESS_TRAIN_MAX_STEPS", "100")))
+    parser.add_argument("--batch-size", type=int, default=int(os.environ.get("VOXPRESS_TRAIN_BATCH_SIZE", "1")))
+    parser.add_argument("--gradient-accumulation-steps", type=int, default=int(os.environ.get("VOXPRESS_TRAIN_GRAD_ACCUM", "8")))
+    parser.add_argument("--learning-rate", type=float, default=float(os.environ.get("VOXPRESS_TRAIN_LR", "1e-5")))
+    parser.add_argument("--lora-rank", type=int, default=int(os.environ.get("VOXPRESS_LORA_RANK", "16")))
+    parser.add_argument("--lora-alpha", type=int, default=int(os.environ.get("VOXPRESS_LORA_ALPHA", "32")))
+    parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--check-deps", action="store_true")
+    args = parser.parse_args()
+
+    if args.check_deps:
+        return 0 if require_training_dependencies() else 2
+    if not args.manifest or not args.output_dir:
+        parser.error("--manifest and --output-dir are required unless --check-deps is used")
+    if args.dry_run:
+        return run_dry(args)
+    return run_real(args)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

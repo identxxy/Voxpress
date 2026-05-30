@@ -2,6 +2,7 @@
 import argparse
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -23,6 +24,9 @@ VOXTYPE_CONFIG_PATH = os.environ.get(
 )
 POPUP_UI = os.environ.get(
     "VOXTYPE_POPUP_UI", os.path.expanduser("~/.local/bin/voxpress-popup-ui")
+)
+CORRECTION_STORE = os.environ.get(
+    "VOXPRESS_CORRECTION_STORE", os.path.expanduser("~/.local/bin/voxpress-correction-store")
 )
 ENABLE_SCRIPT = os.environ.get(
     "VOXTYPE_PAUSE_ENABLE", os.path.expanduser("~/.local/bin/voxpress-pause-enable")
@@ -51,6 +55,19 @@ DEFAULT_SETTINGS = {
     "trigger_key": "Pause",
     "confirm_key": "Return",
     "cancel_key": "Scroll_Lock",
+    "correction_collection_enabled": True,
+    "correction_max_storage_mb": 256,
+    "correction_max_samples": 1000,
+    "auto_train_enabled": True,
+    "auto_train_time": "04:00",
+    "auto_train_max_minutes": 30,
+    "auto_train_max_epochs": 5,
+    "auto_promote_model": True,
+    "training_python_path": "",
+    "gpu_check_count": 2,
+    "gpu_check_interval_seconds": 300,
+    "gpu_busy_utilization_percent": 30,
+    "gpu_busy_process_memory_mb": 4096,
 }
 
 SETTING_LIMITS = {
@@ -68,6 +85,14 @@ SETTING_LIMITS = {
     "preview_height": (160, 900),
     "horizontal_fraction": (0.05, 0.95),
     "vertical_fraction": (0.20, 0.90),
+    "correction_max_storage_mb": (16, 4096),
+    "correction_max_samples": (10, 100000),
+    "auto_train_max_minutes": (5, 240),
+    "auto_train_max_epochs": (1, 100),
+    "gpu_check_count": (1, 10),
+    "gpu_check_interval_seconds": (0, 3600),
+    "gpu_busy_utilization_percent": (1, 100),
+    "gpu_busy_process_memory_mb": (0, 24576),
 }
 
 SETTING_LABELS = {
@@ -90,6 +115,19 @@ SETTING_LABELS = {
     "trigger_key": "Hold-to-talk key",
     "confirm_key": "Preview confirm key",
     "cancel_key": "Preview cancel key",
+    "correction_collection_enabled": "Save corrected audio",
+    "correction_max_storage_mb": "Correction storage MB",
+    "correction_max_samples": "Correction sample cap",
+    "auto_train_enabled": "Daily fine-tune",
+    "auto_train_time": "Daily training time",
+    "auto_train_max_minutes": "Max training minutes",
+    "auto_train_max_epochs": "Max training epochs",
+    "auto_promote_model": "Auto-switch trained model",
+    "training_python_path": "Training Python",
+    "gpu_check_count": "GPU idle checks",
+    "gpu_check_interval_seconds": "GPU check interval seconds",
+    "gpu_busy_utilization_percent": "GPU busy threshold",
+    "gpu_busy_process_memory_mb": "GPU memory busy MB",
 }
 
 SETTING_HINTS = {
@@ -103,6 +141,15 @@ SETTING_HINTS = {
     "trigger_key": "Restarting the listener applies this key.",
     "confirm_key": "This key confirms the preview popup.",
     "cancel_key": "This key cancels the preview popup and leaves Delete free for editing.",
+    "correction_collection_enabled": "Only manually edited preview samples are saved.",
+    "correction_max_storage_mb": "Oldest samples are deleted when this cap is exceeded.",
+    "correction_max_samples": "Also delete oldest samples when this count is exceeded.",
+    "auto_train_enabled": "Runs only after GPU idle checks pass.",
+    "auto_train_time": "24-hour local time, for example 04:00.",
+    "auto_train_max_minutes": "Training is stopped after this wall-clock limit.",
+    "auto_train_max_epochs": "Training is also stopped after this many passes over corrected samples.",
+    "auto_promote_model": "Switches Voxtype to the new model after a successful smoke test.",
+    "training_python_path": "Python executable from a conda env with torch, transformers, peft, and soundfile.",
 }
 
 FLOAT_SETTINGS = {
@@ -114,7 +161,14 @@ FLOAT_SETTINGS = {
     "vertical_fraction",
 }
 
-BOOLEAN_SETTINGS = {"append_newline"}
+BOOLEAN_SETTINGS = {
+    "append_newline",
+    "correction_collection_enabled",
+    "auto_train_enabled",
+    "auto_promote_model",
+}
+TIME_SETTINGS = {"auto_train_time"}
+STRING_SETTINGS = {"training_python_path"}
 PREVIEW_KEY_CHOICES = {
     "Pause": "Pause",
     "Scroll_Lock": "Scroll Lock",
@@ -178,6 +232,12 @@ def normalize_settings(raw):
         if key in BOOLEAN_SETTINGS:
             normalized[key] = bool(settings.get(key, default))
             continue
+        if key in TIME_SETTINGS:
+            normalized[key] = normalize_time(settings.get(key, default), default)
+            continue
+        if key in STRING_SETTINGS:
+            normalized[key] = str(settings.get(key, default) or "")
+            continue
         if key in CHOICE_SETTINGS:
             value = str(settings.get(key, default))
             normalized[key] = value if value in CHOICE_SETTINGS[key] else default
@@ -192,6 +252,18 @@ def normalize_settings(raw):
             value = int(round(value))
         normalized[key] = value
     return normalized
+
+
+def normalize_time(value, default):
+    value = str(value or default).strip()
+    if not re.fullmatch(r"\d{1,2}:\d{2}", value):
+        return default
+    hour_text, minute_text = value.split(":", 1)
+    hour = int(hour_text)
+    minute = int(minute_text)
+    if hour > 23 or minute > 59:
+        return default
+    return f"{hour:02d}:{minute:02d}"
 
 
 def load_settings():
@@ -303,6 +375,29 @@ def notify(summary, body=""):
         pass
 
 
+def correction_usage_text():
+    try:
+        result = subprocess.run(
+            [CORRECTION_STORE, "usage"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            timeout=2,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return "Correction data: unavailable"
+    if result.returncode != 0:
+        return "Correction data: unavailable"
+    try:
+        usage = json.loads(result.stdout)
+    except json.JSONDecodeError:
+        return "Correction data: unavailable"
+    audio_mb = usage.get("audio_bytes", 0) / (1024 * 1024)
+    sample_count = usage.get("sample_count", 0)
+    return f"Correction data: {audio_mb:.1f} MB, {sample_count} samples"
+
+
 def hide_popup():
     try:
         subprocess.run(
@@ -319,7 +414,7 @@ def hide_popup():
 class SettingsDialog(Gtk.Dialog):
     def __init__(self):
         super().__init__(title="Voxpress Settings")
-        self.set_default_size(500, 560)
+        self.set_default_size(560, 700)
         self.set_keep_above(True)
         self.controls = {}
         self.settings = load_settings()
@@ -361,8 +456,46 @@ class SettingsDialog(Gtk.Dialog):
         self.add_choice(grid, row, "confirm_key")
         row += 1
         self.add_choice(grid, row, "cancel_key")
+        row += 1
+
+        self.add_section_label(grid, row, "Correction dataset")
+        row += 1
+        self.add_check(grid, row, "correction_collection_enabled")
+        row += 1
+        self.add_spin(grid, row, "correction_max_storage_mb")
+        row += 1
+        self.add_spin(grid, row, "correction_max_samples")
+        row += 1
+        self.add_usage_label(grid, row)
+        row += 1
+
+        self.add_section_label(grid, row, "Daily training")
+        row += 1
+        self.add_check(grid, row, "auto_train_enabled")
+        row += 1
+        self.add_time_entry(grid, row, "auto_train_time")
+        row += 1
+        self.add_spin(grid, row, "auto_train_max_minutes")
+        row += 1
+        self.add_spin(grid, row, "auto_train_max_epochs")
+        row += 1
+        self.add_check(grid, row, "auto_promote_model")
+        row += 1
+        self.add_text_entry(grid, row, "training_python_path")
 
         self.show_all()
+
+    def add_section_label(self, grid, row, text):
+        label = Gtk.Label()
+        label.set_markup(f"<b>{GLib.markup_escape_text(text)}</b>")
+        label.set_xalign(0.0)
+        label.set_margin_top(10)
+        grid.attach(label, 0, row, 2, 1)
+
+    def add_usage_label(self, grid, row):
+        label = Gtk.Label(label=correction_usage_text())
+        label.set_xalign(0.0)
+        grid.attach(label, 0, row, 2, 1)
 
     def add_spin(self, grid, row, key):
         low, high = SETTING_LIMITS[key]
@@ -417,21 +550,41 @@ class SettingsDialog(Gtk.Dialog):
         grid.attach(combo, 1, row, 1, 1)
         self.controls[key] = combo
 
+    def add_time_entry(self, grid, row, key):
+        self.add_text_entry(grid, row, key)
+
+    def add_text_entry(self, grid, row, key):
+        label = Gtk.Label(label=SETTING_LABELS[key])
+        label.set_xalign(0.0)
+        grid.attach(label, 0, row, 1, 1)
+
+        entry = Gtk.Entry()
+        entry.set_text(self.settings[key])
+        entry.set_hexpand(True)
+        if key in SETTING_HINTS:
+            entry.set_tooltip_text(SETTING_HINTS[key])
+        grid.attach(entry, 1, row, 1, 1)
+        self.controls[key] = entry
+
     def reset_defaults(self):
-        for key, value in DEFAULT_SETTINGS.items():
-            control = self.controls[key]
+        for key, control in self.controls.items():
+            value = DEFAULT_SETTINGS[key]
             if key in BOOLEAN_SETTINGS:
                 control.set_active(bool(value))
+            elif key in TIME_SETTINGS or key in STRING_SETTINGS:
+                control.set_text(value)
             elif key in CHOICE_SETTINGS:
                 control.set_active_id(value)
             else:
                 control.set_value(value)
 
     def collect(self):
-        values = {}
+        values = dict(self.settings)
         for key, control in self.controls.items():
             if key in BOOLEAN_SETTINGS:
                 values[key] = control.get_active()
+            elif key in TIME_SETTINGS or key in STRING_SETTINGS:
+                values[key] = control.get_text()
             elif key in CHOICE_SETTINGS:
                 values[key] = control.get_active_id() or DEFAULT_SETTINGS[key]
             else:
