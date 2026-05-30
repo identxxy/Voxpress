@@ -89,8 +89,10 @@ class VoxpressExportWhisperDeployTest(unittest.TestCase):
 
             previous_root = os.environ.get("VOXPRESS_WHISPER_TOOL_ROOT")
             previous_bin = os.environ.get("VOXPRESS_WHISPER_CPP_QUANTIZE_BIN")
+            previous_type = os.environ.get("VOXPRESS_WHISPER_QUANTIZE_TYPE")
             os.environ["VOXPRESS_WHISPER_TOOL_ROOT"] = str(base)
             os.environ.pop("VOXPRESS_WHISPER_CPP_QUANTIZE_BIN", None)
+            os.environ["VOXPRESS_WHISPER_QUANTIZE_TYPE"] = "q5_0"
             try:
                 namespace = runpy.run_path(str(SCRIPT))
                 self.assertIsNone(namespace["maybe_quantize"](base / "ggml-model.bin", output))
@@ -104,6 +106,80 @@ class VoxpressExportWhisperDeployTest(unittest.TestCase):
                     os.environ.pop("VOXPRESS_WHISPER_CPP_QUANTIZE_BIN", None)
                 else:
                     os.environ["VOXPRESS_WHISPER_CPP_QUANTIZE_BIN"] = previous_bin
+                if previous_type is None:
+                    os.environ.pop("VOXPRESS_WHISPER_QUANTIZE_TYPE", None)
+                else:
+                    os.environ["VOXPRESS_WHISPER_QUANTIZE_TYPE"] = previous_type
+
+    def test_current_quantize_binary_is_not_autodetected_without_explicit_opt_in(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            base = Path(tmpdir)
+            current = base / "whisper.cpp-current" / "build" / "bin" / "quantize"
+            marker = base / "current-ran"
+            current.parent.mkdir(parents=True)
+            current.write_text(
+                f"#!/usr/bin/env bash\nprintf ran > {str(marker)!r}\ntouch \"$2\"\nexit 0\n",
+                encoding="utf-8",
+            )
+            current.chmod(0o755)
+            output = base / "deploy"
+            output.mkdir()
+
+            previous_root = os.environ.get("VOXPRESS_WHISPER_TOOL_ROOT")
+            previous_bin = os.environ.get("VOXPRESS_WHISPER_CPP_QUANTIZE_BIN")
+            previous_type = os.environ.get("VOXPRESS_WHISPER_QUANTIZE_TYPE")
+            os.environ["VOXPRESS_WHISPER_TOOL_ROOT"] = str(base)
+            os.environ.pop("VOXPRESS_WHISPER_CPP_QUANTIZE_BIN", None)
+            os.environ["VOXPRESS_WHISPER_QUANTIZE_TYPE"] = "q5_0"
+            try:
+                namespace = runpy.run_path(str(SCRIPT))
+                self.assertIsNone(namespace["maybe_quantize"](base / "ggml-model.bin", output))
+                self.assertFalse(marker.exists())
+            finally:
+                if previous_root is None:
+                    os.environ.pop("VOXPRESS_WHISPER_TOOL_ROOT", None)
+                else:
+                    os.environ["VOXPRESS_WHISPER_TOOL_ROOT"] = previous_root
+                if previous_bin is None:
+                    os.environ.pop("VOXPRESS_WHISPER_CPP_QUANTIZE_BIN", None)
+                else:
+                    os.environ["VOXPRESS_WHISPER_CPP_QUANTIZE_BIN"] = previous_bin
+                if previous_type is None:
+                    os.environ.pop("VOXPRESS_WHISPER_QUANTIZE_TYPE", None)
+                else:
+                    os.environ["VOXPRESS_WHISPER_QUANTIZE_TYPE"] = previous_type
+
+    def test_explicit_quantize_binary_is_used(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            base = Path(tmpdir)
+            quantize = base / "quantize"
+            marker = base / "explicit-ran"
+            quantize.write_text(
+                f"#!/usr/bin/env bash\nprintf \"$3\" > {str(marker)!r}\ntouch \"$2\"\nexit 0\n",
+                encoding="utf-8",
+            )
+            quantize.chmod(0o755)
+            output = base / "deploy"
+            output.mkdir()
+
+            previous_bin = os.environ.get("VOXPRESS_WHISPER_CPP_QUANTIZE_BIN")
+            previous_type = os.environ.get("VOXPRESS_WHISPER_QUANTIZE_TYPE")
+            os.environ["VOXPRESS_WHISPER_CPP_QUANTIZE_BIN"] = str(quantize)
+            os.environ["VOXPRESS_WHISPER_QUANTIZE_TYPE"] = "q5_0"
+            try:
+                namespace = runpy.run_path(str(SCRIPT))
+                quantized = namespace["maybe_quantize"](base / "ggml-model.bin", output)
+                self.assertEqual(quantized, output / "voxpress-personal-whisper-q5_0.bin")
+                self.assertEqual(marker.read_text(encoding="utf-8"), "q5_0")
+            finally:
+                if previous_bin is None:
+                    os.environ.pop("VOXPRESS_WHISPER_CPP_QUANTIZE_BIN", None)
+                else:
+                    os.environ["VOXPRESS_WHISPER_CPP_QUANTIZE_BIN"] = previous_bin
+                if previous_type is None:
+                    os.environ.pop("VOXPRESS_WHISPER_QUANTIZE_TYPE", None)
+                else:
+                    os.environ["VOXPRESS_WHISPER_QUANTIZE_TYPE"] = previous_type
 
     def test_converter_stdout_does_not_pollute_exporter_json_channel(self):
         with tempfile.TemporaryDirectory() as tmpdir:

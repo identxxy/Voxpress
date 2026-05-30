@@ -150,25 +150,10 @@ def maybe_quantize(source_model, output_dir):
     if quant_type.lower() in ("", "0", "false", "no", "none", "off", "disabled"):
         return None
 
-    quantize_bin = os.environ.get("VOXPRESS_WHISPER_CPP_QUANTIZE_BIN")
-    if not quantize_bin:
-        candidates = [
-            DEFAULT_TOOL_ROOT / "whisper.cpp-current" / "build" / "bin" / "quantize",
-            DEFAULT_TOOL_ROOT / "whisper.cpp-current" / "build" / "bin" / "whisper-quantize",
-        ]
-        if os.environ.get("VOXPRESS_ALLOW_LEGACY_WHISPER_QUANTIZE", "0").strip().lower() in ("1", "true", "yes", "on"):
-            candidates.extend(
-                [
-                    DEFAULT_TOOL_ROOT / "whisper.cpp" / "build" / "bin" / "quantize",
-                    DEFAULT_TOOL_ROOT / "whisper.cpp" / "build" / "bin" / "whisper-quantize",
-                ]
-            )
-        for candidate in candidates:
-            if candidate.is_file():
-                quantize_bin = str(candidate)
-                break
+    quantize_bin = os.environ.get("VOXPRESS_WHISPER_CPP_QUANTIZE_BIN", "").strip()
     if not quantize_bin:
         return None
+
     quantize_path = Path(quantize_bin)
     if not quantize_path.is_file():
         return None

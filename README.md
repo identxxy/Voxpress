@@ -2,113 +2,79 @@
 
 Talk is cheap, vibe me the code.
 
-Voxpress is a Linux desktop companion layer for local speech-to-text input. It
-uses [Voxtype](https://github.com/peteonrails/voxtype) as the recording and
-Whisper transcription engine, then adds an X11 hold-to-talk key, editable GTK
-preview, Simplified Chinese conversion, transient clipboard paste, and a tray
-settings UI.
+Voxpress is a Linux/X11 desktop dictation companion for people who want speech
+input that works in any focused window, including terminals and mixed
+Chinese/English text fields.
 
-This is not a fork of Voxtype. Voxpress is a small integration layer around the
-Voxtype CLI and config hooks.
+macOS and Windows ship system dictation. Linux/X11 still lacks a stable,
+background, arbitrary-window voice input layer that behaves well with terminal
+paste, CJK text, and local Whisper transcription. Voxpress fills that gap by
+wrapping the upstream [Voxtype](https://github.com/peteonrails/voxtype) CLI and
+config hooks with a Linux desktop UX.
 
-## Features
+Voxpress is not a fork of Voxtype. Voxtype still handles recording control,
+Whisper model management, and transcription; Voxpress adds the X11 desktop
+layer around it.
 
-- Local free speech-to-text through Voxtype and Whisper models.
-- Chinese + English constrained recognition by default.
+## What It Adds
+
 - Hold-to-talk X11 key listener, defaulting to `Pause`.
-- Editable GTK preview before insertion.
-- Configurable trigger, confirm, and cancel keys from the tray menu.
-- Traditional Chinese to Simplified Chinese conversion with OpenCC.
-- Optional edited-preview correction dataset collection for personal fine-tuning.
-- Daily personal LoRA fine-tune scheduler with NVIDIA GPU idle checks.
-- Automatic newline after confirmed dictation, useful for terminal workflows.
-- Clipboard save/restore so the system clipboard is only used transiently.
-- Kitty/terminal-aware paste key selection.
-- Tray indicator with enable/disable/restart/settings actions.
+- GTK editable preview before text is inserted.
+- Traditional Chinese to Simplified Chinese cleanup with OpenCC.
+- Clipboard-safe paste that restores the user's previous clipboard.
+- Terminal-aware paste behavior, including `Ctrl+Shift+V` where needed.
+- Tray settings for enable/disable/restart, keys, language mode, and preview UI.
+- Optional edited-preview correction collection for personal fine-tuning.
+- Optional daily personal model update pipeline.
 
-## Runtime Model
+## How It Works
 
-Voxpress keeps the components separate:
+1. Hold the trigger key to start recording through Voxtype.
+2. Release the key to stop recording and transcribe locally.
+3. Voxpress cleans up the text and opens an editable GTK preview.
+4. Confirmed text is pasted into the original target window through a guarded
+   clipboard marker.
+5. If you edited the preview, Voxpress can save the audio/text pair as a
+   correction sample for personal training.
 
-- `voxpress-pause-listener` watches XInput key events and calls
-  `voxtype record start/stop/cancel`.
-- `voxpress-popup-ui` is a GTK socket daemon. It has a non-interactive
-  `StatusWindow` for `Recording`, `Transcribing`, and `Saved correction`, and a
-  separate interactive `PreviewWindow` for editing confirmed text.
-- `voxpress-postprocess-preview` is configured as Voxtype's post-process hook.
-  It converts text with OpenCC, opens preview, appends newline if configured,
-  writes an expected-paste marker, and saves edited preview corrections when a
-  captured audio path is available.
-- `voxpress-correction-store` stores only manually edited preview samples. Audio
-  stays as WAV files under `~/.local/share/voxpress/corrections/audio/`; SQLite
-  stores metadata and training history.
-- `voxpress-finetune-daily` is run by a user systemd timer. It checks that the
-  NVIDIA GPU is idle before training. Training always produces LoRA artifacts;
-  automatic promotion is enabled by default after a smoke test and only accepts
-  deployable whisper.cpp-style local model artifacts, not Python wrapper markers.
-- `voxpress-train-whisper-lora` fine-tunes a LoRA adapter on corrected samples.
-- `voxpress-export-whisper-deploy` merges the LoRA into the base Whisper model
-  and exports a deployable whisper.cpp GGML artifact.
-- `voxpress-save-clipboard-x11` and `voxpress-paste-x11` make clipboard output
-  behave like direct input while restoring the user's previous clipboard.
-- `voxpress-indicator` provides the tray settings UI.
+The main scripts are installed as `voxpress-*` commands and run as user systemd
+services plus Voxtype pre/post hooks.
 
 ## Requirements
 
-Voxpress currently targets GNOME/X11-style desktops.
+Voxpress currently targets GNOME/X11-style desktop sessions. Wayland support is
+not implemented yet.
 
-System packages:
+Runtime dependencies:
 
-- Python 3
-- GTK3 / PyGObject (`gi`)
-- Ayatana AppIndicator GI bindings
-- `xinput`
-- `xmodmap`
-- `xclip`
-- `xdotool`
-- `xwininfo`
-- `xrandr`
-- `notify-send`
-- `parec` from PulseAudio/PipeWire tools, used for corrected-sample audio
-  capture
-- `nvidia-smi` if daily automatic training is enabled
+- `voxtype`, already installed and configured with a local Whisper model.
+- Python 3.
+- GTK3 / PyGObject (`gi`).
+- Ayatana AppIndicator GI bindings.
+- `opencc`.
+- X11 desktop tools: `xinput`, `xmodmap`, `xclip`, `xdotool`, `xwininfo`,
+  `xrandr`, `notify-send`.
+- `parec` from PulseAudio/PipeWire tools if correction audio collection is
+  enabled.
 
-Python package:
+Optional personal-training dependencies:
 
-- `opencc`
+- NVIDIA GPU tooling, especially `nvidia-smi`, for idle checks.
+- Python environment with `torch`, `transformers`, `peft`, and `soundfile`.
+- Hugging Face access/cache for the configured base Whisper model.
 
-Optional training packages for personal fine-tuning:
+Optional export tooling for automatic model promotion:
 
-- `torch`
-- `transformers`
-- `peft`
-- `soundfile`
+- whisper.cpp's `convert-h5-to-ggml.py`.
+- OpenAI Whisper source assets, especially `whisper/assets/mel_filters.npz`.
+- A validated whisper.cpp quantizer only if you explicitly want quantization.
+  Older quantizers may produce models that load but transcribe badly, so
+  Voxpress does not auto-detect quantizers.
 
-Optional deployment tooling for automatic personal-model promotion:
-
-- whisper.cpp conversion tooling exposed through
-  `VOXPRESS_WHISPER_CPP_CONVERT_SCRIPT` and `VOXPRESS_OPENAI_WHISPER_REPO`
-- optionally an explicitly configured `VOXPRESS_WHISPER_CPP_QUANTIZE_BIN` and
-  `VOXPRESS_WHISPER_QUANTIZE_TYPE`; legacy whisper.cpp quantizers are not
-  auto-detected because incompatible quantizers can produce loadable but
-  degenerate models
-
-Training is capped by both `auto_train_max_minutes` and
-`auto_train_max_epochs`; the first limit hit stops the training phase. This keeps
-small correction sets from being replayed for the full wall-clock budget.
-Export/package conversion is deterministic and has no default timeout; set
-`VOXPRESS_EXPORT_TIMEOUT_SECONDS` or `VOXPRESS_DAILY_TRAIN_WATCHDOG_SECONDS`
-only if an operational watchdog is needed.
-After a generated model passes the local smoke test, Voxpress switches Voxtype
-to that model by default.
-The promoted model is copied to a stable path under
-`~/.local/share/voxpress/models/current/`, and timestamped training run
-directories are pruned after promotion so large intermediate artifacts do not
-accumulate.
-
-Runtime dependency:
-
-- `voxtype` installed and configured with a local Whisper model.
+The checkout includes `scripts/doctor.sh` for dependency checks and
+`scripts/install-training-tools.sh` for minimal export-tool bootstrap. Treat
+them as setup aids, not as a guarantee that every desktop, driver, or
+model-cache state can be fixed automatically.
 
 ## Install
 
@@ -137,7 +103,7 @@ fallback_on_empty = false
 The installer copies:
 
 - scripts to `~/.local/bin/voxpress-*`
-- settings to `~/.config/voxpress/settings.json` if missing
+- default settings to `~/.config/voxpress/settings.json` if missing
 - user services to `~/.config/systemd/user/`
 - desktop launchers to `~/.local/share/applications/`
 
@@ -150,50 +116,52 @@ present, because those conflict with the Voxpress listener and tray UI.
 1. Put focus in an input field or terminal.
 2. Hold `Pause` to record.
 3. Release `Pause` to transcribe.
-4. Edit the preview text.
+4. Edit the preview text if needed.
 5. Press `Enter` to insert, or `Scroll Lock` to cancel.
 
 Defaults can be changed from the tray menu:
 
-- `Hold-to-talk key`
-- `Preview confirm key`
-- `Preview cancel key`
-- popup opacity, panel alpha, text size, dimensions, position
+- hold-to-talk, confirm, and cancel keys
+- language mode
+- preview size, position, opacity, and text size
 - append-newline behavior
-- correction storage, daily training, and the Python executable used for
-  offline training
-- recognition language mode
+- correction storage and daily training settings
+- Python executable used for offline training
 
 ## Personal Custom Training
 
-When preview text is manually edited and confirmed, Voxpress can save that
-audio/text pair as a correction sample. Daily training can then fine-tune a LoRA
-adapter, export it to a whisper.cpp GGML model, smoke-test it, and switch
-Voxtype to the new personal model automatically.
+Personal training is optional. The short version is:
 
-By default, corrected audio is capped at `256 MB`, training is capped by both
-`30` minutes and `5` epochs, and successful promotion replaces a single stable
-model at:
+```text
+edited preview corrections -> daily LoRA -> GGML export -> smoke test -> stable current model
+```
+
+Only manually edited and confirmed preview samples are saved. Daily training can
+fine-tune a LoRA adapter from those corrections, merge it into the base Whisper
+model, export a whisper.cpp/GGML artifact, smoke-test it through Voxtype local
+mode, and promote it only if the test output looks usable.
+
+By default, corrected audio is capped at `256 MB`; training is capped by both
+`30` minutes and `5` epochs; and successful promotion replaces one stable model
+at:
 
 ```text
 ~/.local/share/voxpress/models/current/voxpress-personal-whisper.bin
 ```
 
-Timestamped training runs are temporary workspaces and are pruned after
-promotion, so Voxpress does not keep one full model per day.
+Timestamped training run directories are temporary workspaces and are pruned
+after promotion, so Voxpress does not keep one full model per day.
 
-Important knobs in `~/.config/voxpress/settings.json`:
+Useful settings in `~/.config/voxpress/settings.json`:
 
-- `correction_collection_enabled`: save edited preview samples.
-- `correction_max_storage_mb`: storage cap for correction audio, default `256`.
-- `auto_train_enabled`: enable the daily scheduler.
-- `auto_train_time`: local 24-hour time gate, default `04:00`.
-- `auto_train_max_minutes`: wall-clock training cap, default `30`.
-- `auto_train_max_epochs`: sample replay cap, default `5`.
-- `auto_promote_model`: switch to the new model after smoke test, default
-  `true`.
-- `training_python_path`: Python executable with `torch`, `transformers`,
-  `peft`, and `soundfile`.
+- `correction_collection_enabled`
+- `correction_max_storage_mb`
+- `auto_train_enabled`
+- `auto_train_time`
+- `auto_train_max_minutes`
+- `auto_train_max_epochs`
+- `auto_promote_model`
+- `training_python_path`
 
 ## Services
 

@@ -101,10 +101,10 @@ Project-level guidance for agents working on Voxpress.
   - Default OpenAI Whisper assets/repo path is
     `~/.local/share/voxpress/tools/whisper`; the converter needs
     `whisper/assets/mel_filters.npz` there.
-  - Legacy whisper.cpp quantizers are not auto-detected because an older
-    quantizer produced loadable but degenerate large-v3-turbo output. Use an
-    explicit `VOXPRESS_WHISPER_CPP_QUANTIZE_BIN` only after validating that
-    binary on the target model family.
+  - whisper.cpp quantizers are not auto-detected because an older quantizer
+    produced loadable but degenerate large-v3-turbo output. Use an explicit
+    `VOXPRESS_WHISPER_CPP_QUANTIZE_BIN` only after validating that binary on the
+    target model family.
 
 - `bin/voxpress-save-clipboard-x11` and `bin/voxpress-paste-x11`
   - Save current clipboard before Voxtype writes output.
@@ -142,6 +142,9 @@ Personal training dependencies:
 - `nvidia-smi` if automatic GPU-idle gating is enabled.
 - Hugging Face access/cache for the configured base model, default
   `openai/whisper-large-v3-turbo`.
+- Enough local disk for a temporary merged Hugging Face model and one
+  whisper.cpp/GGML export during training. Successful promotion prunes most
+  run-local large artifacts, but the active run needs working space first.
 
 Deployment/export tooling:
 
@@ -149,10 +152,9 @@ Deployment/export tooling:
   This can be the converter script from whisper.cpp.
 - `~/.local/share/voxpress/tools/whisper/whisper/assets/mel_filters.npz`.
   The easiest source is the OpenAI Whisper Python package source tree.
-- Optional: a validated modern whisper.cpp quantizer. Do not rely on the old
-  `~/.local/share/voxpress/tools/whisper.cpp/build/bin/quantize` path unless
-  `VOXPRESS_ALLOW_LEGACY_WHISPER_QUANTIZE=1` is set deliberately and the output
-  has passed a real Voxtype smoke test.
+- Optional: a validated modern whisper.cpp quantizer. Voxpress does not
+  auto-detect quantizers; set `VOXPRESS_WHISPER_CPP_QUANTIZE_BIN` only after the
+  exact binary has passed a real Voxtype smoke test on the target model family.
 
 Minimal deployment-tool bootstrap:
 
@@ -201,18 +203,167 @@ print(sorted(data.files))
 PY
 ```
 
-Important environment overrides:
+If present, `scripts/install-training-tools.sh` may be used as a convenience
+bootstrap for the converter and OpenAI Whisper assets, but it intentionally does
+not install training Python packages or enable quantization. It should not be
+treated as replacing the manual path checks above. If present,
+`scripts/doctor.sh` may be used as a convenience environment audit, but agents
+should still inspect the exact missing dependency or failed smoke-test reason
+before changing code.
 
+## Environment Overrides
+
+Desktop/correction collection:
+
+- `VOXPRESS_SETTINGS` / `VOXTYPE_POPUP_SETTINGS`: settings JSON path.
+- `VOXPRESS_AUDIO_CAPTURE_CMD`: audio capture command template using `{path}`.
+- `VOXPRESS_AUDIO_DEVICE`: source passed to the default `parec` capture path.
+- `VOXPRESS_CORRECTION_COLLECTION`: enable/disable correction sample capture.
+- `VOXPRESS_CORRECTION_STORE`: post-process hook path for
+  `voxpress-correction-store`.
+- `VOXPRESS_CORRECTION_DIR`: correction store root; defaults to
+  `~/.local/share/voxpress/corrections`.
+- `VOXPRESS_CORRECTION_MAX_STORAGE_MB`: corrected-audio retention cap.
+- `VOXPRESS_CORRECTION_MAX_SAMPLES`: corrected-sample count retention cap.
+- `VOXTYPE_AUDIO_PATH`: explicit audio path for post-process tests or custom
+  integrations.
+- `VOXTYPE_AUDIO_DURATION_SECONDS`: explicit audio duration metadata.
+
+Daily scheduler and promotion:
+
+- `VOXPRESS_AUTO_TRAIN_ENABLED`: override the daily training enable switch.
+- `VOXPRESS_AUTO_TRAIN_MAX_MINUTES`: wall-clock training budget.
+- `VOXPRESS_AUTO_TRAIN_MAX_EPOCHS`: corrected-sample replay cap.
+- `VOXPRESS_AUTO_PROMOTE_MODEL`: enable/disable automatic promotion after a
+  deployable train result.
+- `VOXPRESS_GPU_CHECK_COUNT`: number of idle checks before training.
+- `VOXPRESS_GPU_CHECK_INTERVAL_SECONDS`: delay between idle checks.
+- `VOXPRESS_GPU_BUSY_UTILIZATION_PERCENT`: GPU utilization busy threshold.
+- `VOXPRESS_GPU_BUSY_PROCESS_MEMORY_MB`: process memory busy threshold.
+- `VOXPRESS_NVIDIA_SMI`: explicit `nvidia-smi` binary/path for GPU checks.
+- `VOXPRESS_MODEL_RUNS_DIR`: timestamped training workspace root; defaults to
+  `~/.local/share/voxpress/models/runs`.
+- `VOXPRESS_CURRENT_MODEL_PATH`: stable promoted GGML model path; defaults to
+  `~/.local/share/voxpress/models/current/voxpress-personal-whisper.bin`.
 - `VOXPRESS_TRAIN_PYTHON`: Python executable for training/export.
+- `VOXPRESS_TRAIN_COMMAND`: custom training command template. Supported fields
+  are `{manifest}`, `{output_dir}`, `{max_minutes}`, and `{max_epochs}`.
+- `VOXPRESS_DAILY_TRAIN_WATCHDOG_SECONDS`: optional scheduler-level watchdog.
+- `VOXPRESS_MODEL_SMOKE_TIMEOUT_SECONDS`: Voxtype model smoke-test timeout.
+- `VOXPRESS_SKIP_MODEL_SMOKE_TEST`: test-only escape hatch; do not use for
+  real promotion unless the caller deliberately accepts bad-model risk.
+- `VOXPRESS_VOXTYPE_BIN`: Voxtype CLI path used by the smoke test.
+- `VOXTYPE_CONFIG_PATH`: Voxtype config path updated during promotion.
+- `VOXPRESS_SYSTEMCTL`: `systemctl` path/command used to restart Voxtype.
+- `VOXPRESS_WHISPER_CLI_WRAPPER`: wrapper path used to identify non-promotable
+  dry-run or CLI-wrapper artifacts.
+
+LoRA training:
+
 - `VOXPRESS_BASE_WHISPER_MODEL`: Hugging Face base model.
+- `VOXPRESS_TRAIN_LANGUAGE`: Whisper processor language; default `zh`.
+- `VOXPRESS_TRAIN_MAX_EPOCHS`: direct trainer default when the scheduler does
+  not pass `--max-epochs`.
+- `VOXPRESS_TRAIN_MAX_STEPS`: trainer step cap.
+- `VOXPRESS_TRAIN_BATCH_SIZE`: microbatch size.
+- `VOXPRESS_TRAIN_GRAD_ACCUM`: gradient accumulation steps.
+- `VOXPRESS_TRAIN_LR`: AdamW learning rate.
+- `VOXPRESS_LORA_RANK`: LoRA rank.
+- `VOXPRESS_LORA_ALPHA`: LoRA alpha.
+- `VOXPRESS_EXPORT_TIMEOUT_SECONDS`: optional exporter subprocess timeout.
+- `VOXPRESS_DRY_RUN_DEPLOY_MODEL`: dry-run trainer output marker path for
+  tests; marker artifacts are intentionally not promotable.
+
+Export/deployment:
+
 - `VOXPRESS_WHISPER_TOOL_ROOT`: root for local whisper tooling.
-- `VOXPRESS_WHISPER_CPP_CONVERT_SCRIPT`: explicit converter script.
+- `VOXPRESS_WHISPER_CPP_CONVERT_SCRIPT`: explicit whisper.cpp converter script.
 - `VOXPRESS_OPENAI_WHISPER_REPO`: explicit OpenAI Whisper source/assets path.
-- `VOXPRESS_WHISPER_CPP_QUANTIZE_BIN`: explicit quantizer.
+- `VOXPRESS_WHISPER_EXPORT_COMMAND`: custom export command template. Supported
+  fields are `{base_model}`, `{adapter_dir}`, `{processor_dir}`, `{merged_dir}`,
+  and `{output_dir}`.
+- `VOXPRESS_WHISPER_CPP_QUANTIZE_BIN`: explicit quantizer binary.
 - `VOXPRESS_WHISPER_QUANTIZE_TYPE`: quantization type; use `none`/`off` to
   disable quantization.
-- `VOXPRESS_AUDIO_CAPTURE_CMD`: audio capture command template using `{path}`.
-- `VOXPRESS_CURRENT_MODEL_PATH`: override stable promoted model path.
+
+## Custom Training Pipeline
+
+The personal training pipeline is intentionally local, bounded, and conservative.
+It learns only from manually edited preview corrections, not from every accepted
+transcription.
+
+Data flow:
+
+- `bin/voxpress-pause-listener` starts a temporary 16 kHz mono WAV capture on
+  hold-to-talk press and records the pending path under
+  `$XDG_RUNTIME_DIR/voxtype/correction_audio_path`.
+- `bin/voxpress-postprocess-preview` owns the save decision. It saves only when
+  preview text was edited and confirmed. Unchanged text, canceled preview, short
+  taps, empty output, and missing audio should delete the temporary audio.
+- `bin/voxpress-correction-store save-edited` moves the temporary WAV into the
+  durable correction store and inserts metadata into SQLite. It enforces both
+  byte and sample-count retention immediately after each insert.
+- `bin/voxpress-finetune-daily run` is the scheduler entrypoint. It gates work
+  by `auto_train_enabled`, `auto_train_time`, one attempt per local day, sample
+  availability, GPU idle checks, and trainer dependency checks.
+- The scheduler writes a `train-manifest.json` into a timestamped run directory,
+  launches `bin/voxpress-train-whisper-lora`, captures `train.stdout.log` and
+  `train.stderr.log`, and records training status in the correction database.
+- `bin/voxpress-train-whisper-lora` loads the manifest, checks WAV sample rate,
+  fine-tunes LoRA adapters on Whisper, writes `adapter/`, `processor/`, and
+  delegates deployable artifact creation to `bin/voxpress-export-whisper-deploy`.
+- `bin/voxpress-export-whisper-deploy` merges LoRA into the base Hugging Face
+  model, converts the merged model to whisper.cpp/GGML, optionally applies an
+  explicitly validated quantizer, and reports `deploy_model_path` as JSON.
+- The scheduler promotes only real local whisper.cpp/GGML artifacts. It rejects
+  dry-run wrapper markers, missing files, empty smoke output, and degenerate
+  repeated-token smoke output.
+- Promotion copies the deploy artifact to the stable current-model path, updates
+  `[whisper].model` in the Voxtype config, removes experimental
+  `[whisper].mode` / `whisper_cli_path` keys, restarts `voxtype.service`, records
+  promotion metadata, and prunes large run artifacts.
+
+Default data paths:
+
+- Temporary correction audio:
+  `$XDG_RUNTIME_DIR/voxtype/correction-audio/`.
+- Pending correction markers:
+  `$XDG_RUNTIME_DIR/voxtype/correction_audio_path` and
+  `$XDG_RUNTIME_DIR/voxtype/correction_audio_duration`.
+- Durable correction root:
+  `~/.local/share/voxpress/corrections/`.
+- Correction audio:
+  `~/.local/share/voxpress/corrections/audio/YYYY-MM-DD/*.wav`.
+- Correction database:
+  `~/.local/share/voxpress/corrections/index.sqlite`.
+- Daily scheduler state:
+  `~/.local/share/voxpress/corrections/auto_train_state.json`.
+- Training runs:
+  `~/.local/share/voxpress/models/runs/<timestamp>/`.
+- Stable promoted model:
+  `~/.local/share/voxpress/models/current/voxpress-personal-whisper.bin`.
+- Stable promoted metadata:
+  `~/.local/share/voxpress/models/current/metadata.json`.
+- Default training tool root:
+  `~/.local/share/voxpress/tools/`.
+
+Training run contents:
+
+- `train-manifest.json`: snapshot of selected correction samples.
+- `train.stdout.log` / `train.stderr.log`: scheduler-captured trainer logs.
+- `adapter/`: PEFT LoRA adapter, temporary after successful promotion.
+- `processor/`: matching Whisper processor, temporary after successful
+  promotion.
+- `deploy/`: merged/exported model workspace, temporary after successful
+  promotion.
+- `deploy/merged-hf/`: intermediate merged Hugging Face model.
+- `deploy/whisper-cpp-convert.stdout.log` and
+  `deploy/whisper-cpp-convert.stderr.log`: converter logs.
+- `deploy/custom-export.stdout.log` and `deploy/custom-export.stderr.log`:
+  custom exporter logs when `VOXPRESS_WHISPER_EXPORT_COMMAND` is used.
+- `model-smoke.config.toml`, `model-smoke.stdout.log`,
+  `model-smoke.stderr.log`: promotion smoke-test artifacts.
+- `train-result.json`: source of truth for train/export/promotion result.
 
 ## Settings Schema
 
@@ -277,6 +428,9 @@ Key names are X11/GDK key names, not arbitrary labels. Existing aliases:
 
 - Only manually edited preview samples are saved. Do not save unchanged
   transcriptions as training data.
+- The correction store is the only durable training dataset. Temporary audio in
+  `$XDG_RUNTIME_DIR` is an implementation detail and should be removed unless a
+  confirmed edit is saved.
 - Corrected audio lives outside git under `~/.local/share/voxpress/corrections/`.
   Do not commit audio samples, SQLite data, model weights, Hugging Face caches,
   or whisper.cpp build trees.
@@ -286,6 +440,18 @@ Key names are X11/GDK key names, not arbitrary labels. Existing aliases:
 - `runs/<timestamp>/` directories are workspaces for training/export logs. After
   successful promotion, large run artifacts (`deploy/`, `adapter/`,
   `processor/`, `*.bin`) are deleted.
+- The scheduler records one attempt per local day only after a train attempt,
+  failed train spawn, timeout, smoke failure, non-promoted train, or promotion
+  result. Dependency-missing skips should not consume the daily attempt.
+- The trainer uses a small LoRA adaptation over Whisper attention projections.
+  This keeps personal updates cheap and bounded, but also means bad correction
+  samples have high leverage when the dataset is tiny.
+- The `--max-epochs` cap is as important as `--max-minutes`: with a very small
+  correction set, replaying the same edits for the full wall-clock budget can
+  overfit or destabilize the adapter.
+- The current pipeline has no held-out evaluation set. Promotion quality is
+  protected only by a deployability check plus a real Voxtype smoke test on a
+  correction sample.
 - Export/package conversion has no default timeout. Use
   `VOXPRESS_EXPORT_TIMEOUT_SECONDS` or `VOXPRESS_DAILY_TRAIN_WATCHDOG_SECONDS`
   only as operational watchdogs.
@@ -306,10 +472,57 @@ Run these after meaningful edits:
 ```bash
 python -m py_compile bin/voxpress-popup-ui bin/voxpress-pause-listener bin/voxpress-indicator bin/voxpress-postprocess-preview bin/voxpress-correction-store bin/voxpress-finetune-daily bin/voxpress-train-whisper-lora bin/voxpress-export-whisper-deploy bin/voxpress-whisper-cli-wrapper
 python -m unittest tests/test_voxpress_postprocess.py tests/test_voxpress_popup_ui.py tests/test_voxpress_listener_audio.py tests/test_voxpress_correction_store.py tests/test_voxpress_finetune_daily.py tests/test_voxpress_export_whisper_deploy.py tests/test_voxpress_train_whisper_lora.py
-bash -n bin/voxpress-paste-x11 scripts/install.sh
+bash -n bin/voxpress-paste-x11 scripts/install.sh scripts/doctor.sh scripts/install-training-tools.sh
 bin/voxpress-indicator check
 bin/voxpress-popup-ui ping
 ```
+
+For documentation-only edits to this file, at minimum run:
+
+```bash
+git diff --check -- AGENTS.md
+rg -n '(/[h]ome/vox|/[m]nt/afs|x[i]nyuan|run_[0-9]|api[_-]?key|[p]assword|[s]ecret)' AGENTS.md
+```
+
+Training-specific validation:
+
+- Dependency check:
+
+  ```bash
+  bin/voxpress-train-whisper-lora --check-deps
+  ```
+
+- Export tooling check: verify the converter compiles and the OpenAI Whisper
+  assets file contains usable mel filters:
+
+  ```bash
+  python -m py_compile ~/.local/share/voxpress/tools/whisper.cpp/models/convert-h5-to-ggml.py
+  python - <<'PY'
+import numpy as np
+from pathlib import Path
+
+path = Path.home() / ".local/share/voxpress/tools/whisper/whisper/assets/mel_filters.npz"
+data = np.load(path)
+print(sorted(data.files))
+PY
+  ```
+
+- Scheduler GPU gate:
+
+  ```bash
+  bin/voxpress-finetune-daily check-gpu
+  ```
+
+- Safe scheduler dry/smoke validation: use a temporary `VOXPRESS_CORRECTION_DIR`
+  and `VOXPRESS_MODEL_RUNS_DIR`, or the unit tests, unless the user explicitly
+  wants to train on their real correction store. Avoid running a real full
+  fine-tune as a generic validation step.
+- Promotion validation: confirm the promoted model path is the stable current
+  model, then verify Voxtype local mode loads that exact path instead of falling
+  back to a built-in model.
+- If `scripts/doctor.sh` exists, it can be run as an additional audit. If
+  `scripts/install-training-tools.sh` exists, use it only as a bootstrap helper;
+  still verify the converter/assets/quantizer paths above.
 
 On a live install:
 
