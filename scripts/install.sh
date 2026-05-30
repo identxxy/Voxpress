@@ -44,6 +44,12 @@ fi
 
 install -m 644 "$ROOT"/packaging/systemd/user/*.service "$SYSTEMD_USER_DIR"/
 install -m 644 "$ROOT"/packaging/systemd/user/*.timer "$SYSTEMD_USER_DIR"/
+for dropin_dir in "$ROOT"/packaging/systemd/user/*.service.d; do
+  [[ -d "$dropin_dir" ]] || continue
+  service_name="$(basename "$dropin_dir")"
+  install -d "$SYSTEMD_USER_DIR/$service_name"
+  install -m 644 "$dropin_dir"/*.conf "$SYSTEMD_USER_DIR/$service_name"/
+done
 install -m 644 "$ROOT"/packaging/desktop/*.desktop "$APPLICATIONS_DIR"/
 
 systemctl --user daemon-reload

@@ -442,6 +442,8 @@ class StatusWindow:
             else Gtk.WindowType.POPUP
         )
         self.window = Gtk.Window(type=window_type, title="Voxpress status")
+        self.window.set_wmclass("voxpress-status", "VoxpressStatus")
+        self.window.set_role("voxpress-status")
         self.window.set_keep_above(True)
         self.window.set_skip_taskbar_hint(True)
         self.window.set_skip_pager_hint(True)
@@ -581,6 +583,8 @@ class PreviewWindow:
         self.visible_opacity = self.settings["window_opacity"]
 
         self.window = Gtk.Window(type=Gtk.WindowType.TOPLEVEL, title="Voxpress preview")
+        self.window.set_wmclass("voxpress-preview", "VoxpressPreview")
+        self.window.set_role("voxpress-preview")
         self.window.set_keep_above(True)
         self.window.set_skip_taskbar_hint(True)
         self.window.set_skip_pager_hint(True)

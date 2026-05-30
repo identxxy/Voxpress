@@ -24,6 +24,42 @@ def load_listener(runtime_dir, capture_cmd):
 
 
 class VoxpressListenerAudioTest(unittest.TestCase):
+    def test_listener_imports_x11_environment_from_user_manager(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            runtime = Path(tmpdir)
+            fake_systemctl = runtime / "systemctl"
+            fake_systemctl.write_text(
+                "#!/usr/bin/env bash\n"
+                "if [[ \"$1\" == \"--user\" && \"$2\" == \"show-environment\" ]]; then\n"
+                "  printf 'DISPLAY=:9\\n'\n"
+                "  printf 'XAUTHORITY=/tmp/voxpress-test-xauthority\\n'\n"
+                "  exit 0\n"
+                "fi\n"
+                "exit 1\n",
+                encoding="utf-8",
+            )
+            fake_systemctl.chmod(0o755)
+
+            previous = {
+                "DISPLAY": os.environ.get("DISPLAY"),
+                "XAUTHORITY": os.environ.get("XAUTHORITY"),
+                "VOXPRESS_SYSTEMCTL": os.environ.get("VOXPRESS_SYSTEMCTL"),
+            }
+            os.environ.pop("DISPLAY", None)
+            os.environ.pop("XAUTHORITY", None)
+            os.environ["VOXPRESS_SYSTEMCTL"] = str(fake_systemctl)
+            try:
+                listener = load_listener(runtime, "true {path}")
+                self.assertTrue(listener.ensure_x11_environment())
+                self.assertEqual(os.environ["DISPLAY"], ":9")
+                self.assertEqual(os.environ["XAUTHORITY"], "/tmp/voxpress-test-xauthority")
+            finally:
+                for key, value in previous.items():
+                    if value is None:
+                        os.environ.pop(key, None)
+                    else:
+                        os.environ[key] = value
+
     def test_audio_capture_writes_pending_path_on_keep(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             runtime = Path(tmpdir)

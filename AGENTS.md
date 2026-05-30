@@ -55,6 +55,13 @@ Project-level guidance for agents working on Voxpress.
     confirmed. Unchanged and canceled previews delete the temporary correction
     audio.
 
+- `bin/voxpress-run-with-user-env`
+  - Small launcher used by the installed `voxtype.service` drop-in.
+  - Waits for `DISPLAY`/`WAYLAND_DISPLAY`, imports graphical-session variables
+    from `systemctl --user show-environment`, then `exec`s the real command.
+  - This prevents Voxtype from starting after reboot without `DISPLAY` /
+    `XAUTHORITY`, which breaks preview, X11 clipboard output, and paste hooks.
+
 - `bin/voxpress-correction-store`
   - Stores edited correction samples under
     `~/.local/share/voxpress/corrections/`.
@@ -470,7 +477,7 @@ Key names are X11/GDK key names, not arbitrary labels. Existing aliases:
 Run these after meaningful edits:
 
 ```bash
-python -m py_compile bin/voxpress-popup-ui bin/voxpress-pause-listener bin/voxpress-indicator bin/voxpress-postprocess-preview bin/voxpress-correction-store bin/voxpress-finetune-daily bin/voxpress-train-whisper-lora bin/voxpress-export-whisper-deploy bin/voxpress-whisper-cli-wrapper
+python -m py_compile bin/voxpress-popup-ui bin/voxpress-pause-listener bin/voxpress-indicator bin/voxpress-postprocess-preview bin/voxpress-correction-store bin/voxpress-finetune-daily bin/voxpress-train-whisper-lora bin/voxpress-export-whisper-deploy bin/voxpress-whisper-cli-wrapper bin/voxpress-run-with-user-env
 python -m unittest tests/test_voxpress_postprocess.py tests/test_voxpress_popup_ui.py tests/test_voxpress_listener_audio.py tests/test_voxpress_correction_store.py tests/test_voxpress_finetune_daily.py tests/test_voxpress_export_whisper_deploy.py tests/test_voxpress_train_whisper_lora.py
 bash -n bin/voxpress-paste-x11 scripts/install.sh scripts/doctor.sh scripts/install-training-tools.sh
 bin/voxpress-indicator check

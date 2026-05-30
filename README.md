@@ -105,6 +105,8 @@ The installer copies:
 - scripts to `~/.local/bin/voxpress-*`
 - default settings to `~/.config/voxpress/settings.json` if missing
 - user services to `~/.config/systemd/user/`
+- a `voxtype.service` drop-in that waits for the desktop display environment
+  before launching Voxtype
 - desktop launchers to `~/.local/share/applications/`
 
 It keeps `voxtype.service` enabled, but disables the legacy

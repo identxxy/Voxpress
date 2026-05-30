@@ -19,6 +19,7 @@ CONFIG_PATH = os.environ.get(
 DEFAULT_TRIGGER_KEY = os.environ.get("VOXTYPE_TRIGGER_KEY", "Pause")
 KEYCODE_OVERRIDE = os.environ.get("VOXTYPE_PAUSE_KEYCODE")
 VOXTYPE = os.environ.get("VOXTYPE_BIN", "voxtype")
+SYSTEMCTL = os.environ.get("VOXPRESS_SYSTEMCTL", "systemctl")
 POPUP_UI = os.environ.get(
     "VOXTYPE_POPUP_UI", os.path.expanduser("~/.local/bin/voxpress-popup-ui")
 )
@@ -82,6 +83,8 @@ KEY_LABELS = {
     "XF86AudioPlay": "Audio Play/Pause",
 }
 
+GRAPHICAL_ENV_KEYS = ("DISPLAY", "XAUTHORITY")
+
 
 def log(message: str) -> None:
     print(message, flush=True)
@@ -96,6 +99,42 @@ def resolve_xdotool():
 
 
 XDOTOOL = resolve_xdotool()
+
+
+def import_user_manager_environment() -> dict[str, str]:
+    try:
+        result = subprocess.run(
+            [SYSTEMCTL, "--user", "show-environment"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            timeout=1,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return {}
+    if result.returncode != 0:
+        return {}
+
+    updated = {}
+    for line in result.stdout.splitlines():
+        if "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        if key not in GRAPHICAL_ENV_KEYS or not value:
+            continue
+        if os.environ.get(key) == value:
+            continue
+        os.environ[key] = value
+        updated[key] = value
+    return updated
+
+
+def ensure_x11_environment() -> bool:
+    updated = import_user_manager_environment()
+    if updated:
+        log("Imported X11 environment from user manager: " + ", ".join(sorted(updated)))
+    return bool(os.environ.get("DISPLAY"))
 
 
 def normalize_key_name(value: str | None, default: str = DEFAULT_TRIGGER_KEY) -> str:
@@ -484,6 +523,11 @@ def handle_signal(signum, frame) -> None:
 def event_stream():
     cmd = ["/usr/bin/stdbuf", "-oL", "/usr/bin/xinput", "test-xi2", "--root"]
     while True:
+        if not ensure_x11_environment():
+            log("X11 DISPLAY is unavailable; waiting before starting xinput")
+            time.sleep(1)
+            continue
+
         proc = subprocess.Popen(
             cmd,
             stdout=subprocess.PIPE,
@@ -508,6 +552,7 @@ def main() -> int:
     signal.signal(signal.SIGINT, handle_signal)
     signal.signal(signal.SIGTERM, handle_signal)
 
+    ensure_x11_environment()
     refresh_trigger_keycodes(force=True)
     pending_event = None
     for line in event_stream():
