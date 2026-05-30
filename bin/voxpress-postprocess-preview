@@ -32,6 +32,7 @@ RUNTIME_DIR = os.environ.get("XDG_RUNTIME_DIR", f"/tmp/voxtype-{os.getuid()}")
 STATE_DIR = os.path.join(RUNTIME_DIR, "voxtype")
 TARGET_WINDOW_FILE = os.path.join(STATE_DIR, "target_window")
 EXPECTED_PASTE_FILE = os.path.join(STATE_DIR, "expected_paste_text")
+SAVED_CORRECTION_FILE = os.path.join(STATE_DIR, "saved_correction_pending")
 CORRECTION_AUDIO_FILE = os.path.join(STATE_DIR, "correction_audio_path")
 CORRECTION_AUDIO_DURATION_FILE = os.path.join(STATE_DIR, "correction_audio_duration")
 CONFIG_PATH = os.environ.get(
@@ -287,6 +288,17 @@ def write_expected_paste(text: str) -> None:
         pass
 
 
+def mark_saved_correction_pending(window: str | None) -> None:
+    try:
+        os.makedirs(STATE_DIR, exist_ok=True)
+        tmp_path = f"{SAVED_CORRECTION_FILE}.tmp"
+        with open(tmp_path, "w", encoding="utf-8") as handle:
+            handle.write(window or "")
+        os.replace(tmp_path, SAVED_CORRECTION_FILE)
+    except OSError:
+        pass
+
+
 def restore_focus(window: str | None) -> None:
     if not window or os.environ.get("VOXTYPE_RESTORE_FOCUS", "1") == "0":
         return
@@ -389,7 +401,7 @@ def main() -> int:
     converted = convert_t2s(text)
     final_text = edit_preview(converted).strip()
     if maybe_save_correction_sample(text, converted, final_text):
-        notify_saved_correction()
+        mark_saved_correction_pending(get_target_window() or get_active_window())
     final_text = append_output_newline(final_text)
     write_expected_paste(final_text)
     sys.stdout.write(final_text)

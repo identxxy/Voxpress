@@ -6,6 +6,7 @@ sleep "${VOXTYPE_PASTE_DELAY:-0.12}"
 
 STATE_DIR="${XDG_RUNTIME_DIR:-/tmp}/voxtype"
 EXPECTED_PASTE="$STATE_DIR/expected_paste_text"
+SAVED_CORRECTION_PENDING="$STATE_DIR/saved_correction_pending"
 SAVED_CLIPBOARD="$STATE_DIR/saved_clipboard"
 SAVED_STATE="$STATE_DIR/saved_clipboard_state"
 POPUP_UI="${VOXTYPE_POPUP_UI:-$HOME/.local/bin/voxpress-popup-ui}"
@@ -36,15 +37,38 @@ hide_popup() {
   "$POPUP_UI" hide >/dev/null 2>&1 || true
 }
 
+show_saved_correction_if_pending() {
+  if [[ ! -f "$SAVED_CORRECTION_PENDING" ]]; then
+    return
+  fi
+
+  local now marker_mtime max_age reference_window
+  now="$(date +%s)"
+  marker_mtime="$(stat -c %Y "$SAVED_CORRECTION_PENDING" 2>/dev/null || printf '0')"
+  max_age="${VOXPRESS_SAVED_CORRECTION_MAX_AGE:-30}"
+  if (( now - marker_mtime > max_age )); then
+    rm -f "$SAVED_CORRECTION_PENDING"
+    return
+  fi
+
+  reference_window="$(cat "$SAVED_CORRECTION_PENDING" 2>/dev/null || true)"
+  rm -f "$SAVED_CORRECTION_PENDING"
+  if [[ -n "$reference_window" ]]; then
+    "$POPUP_UI" saved-correction --reference-window "$reference_window" >/dev/null 2>&1 || true
+  else
+    "$POPUP_UI" saved-correction >/dev/null 2>&1 || true
+  fi
+}
+
 exit_without_paste() {
   restore_clipboard
   hide_popup
+  show_saved_correction_if_pending
   exit 0
 }
 
 if [[ ! -f "$EXPECTED_PASTE" ]]; then
-  hide_popup
-  exit 0
+  exit_without_paste
 fi
 
 NOW="$(date +%s)"
@@ -117,3 +141,4 @@ fi
 sleep "${VOXTYPE_RESTORE_CLIPBOARD_DELAY:-0.45}"
 restore_clipboard
 hide_popup
+show_saved_correction_if_pending

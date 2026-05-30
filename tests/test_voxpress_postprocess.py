@@ -133,7 +133,11 @@ class VoxpressPostprocessTest(unittest.TestCase):
             self.assertEqual(payload["corrected_text"], "测试 corrected")
             popup_log = popup_log_path.read_text(encoding="utf-8").splitlines()
             self.assertTrue(any(line.startswith("preview") for line in popup_log))
-            self.assertTrue(any(line.startswith("saved-correction") for line in popup_log))
+            self.assertFalse(any(line.startswith("saved-correction") for line in popup_log))
+            self.assertEqual(
+                (state_dir / "saved_correction_pending").read_text(encoding="utf-8"),
+                "123",
+            )
 
     def test_postprocess_consumes_pending_audio_file_and_removes_unchanged_audio(self):
         with tempfile.TemporaryDirectory() as runtime_dir:
