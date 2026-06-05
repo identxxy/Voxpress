@@ -19,8 +19,17 @@ CONFIG_PATH = os.environ.get(
     "VOXTYPE_POPUP_SETTINGS",
     os.environ.get("VOXPRESS_SETTINGS", os.path.expanduser("~/.config/voxpress/settings.json")),
 )
+INITIAL_PROMPT_BACKUP_PATH = os.environ.get(
+    "VOXPRESS_INITIAL_PROMPT_BACKUP",
+    os.path.expanduser("~/.config/voxpress/base-initial-prompt.txt"),
+)
 VOXTYPE_CONFIG_PATH = os.environ.get(
     "VOXTYPE_CONFIG_PATH", os.path.expanduser("~/.config/voxtype/config.toml")
+)
+BASE_VOXTYPE_MODEL = os.environ.get("VOXPRESS_BASE_VOXTYPE_MODEL", "large-v3-turbo")
+PERSONAL_MODEL_PATH = os.environ.get(
+    "VOXPRESS_CURRENT_MODEL_PATH",
+    os.path.expanduser("~/.local/share/voxpress/models/current/voxpress-personal-whisper.bin"),
 )
 POPUP_UI = os.environ.get(
     "VOXTYPE_POPUP_UI", os.path.expanduser("~/.local/bin/voxpress-popup-ui")
@@ -52,6 +61,7 @@ DEFAULT_SETTINGS = {
     "vertical_fraction": 0.75,
     "append_newline": True,
     "language_mode": "zh_en",
+    "recognition_model_mode": "base",
     "trigger_key": "Pause",
     "confirm_key": "Return",
     "cancel_key": "Scroll_Lock",
@@ -112,6 +122,7 @@ SETTING_LABELS = {
     "vertical_fraction": "Vertical position",
     "append_newline": "Append newline",
     "language_mode": "Recognition language",
+    "recognition_model_mode": "Recognition model",
     "trigger_key": "Hold-to-talk key",
     "confirm_key": "Preview confirm key",
     "cancel_key": "Preview cancel key",
@@ -122,7 +133,7 @@ SETTING_LABELS = {
     "auto_train_time": "Daily training time",
     "auto_train_max_minutes": "Max training minutes",
     "auto_train_max_epochs": "Max training epochs",
-    "auto_promote_model": "Auto-switch trained model",
+    "auto_promote_model": "Promote trained model",
     "training_python_path": "Training Python",
     "gpu_check_count": "GPU idle checks",
     "gpu_check_interval_seconds": "GPU check interval seconds",
@@ -137,7 +148,8 @@ SETTING_HINTS = {
     "button_alpha": "Higher values make buttons darker.",
     "horizontal_fraction": "0.50 is screen center.",
     "vertical_fraction": "0.50 is screen center; 0.75 is lower quarter.",
-    "language_mode": "Uses the current multilingual large-v3-turbo model.",
+    "language_mode": "Controls the language list passed to Whisper.",
+    "recognition_model_mode": "Base uses large-v3-turbo; Personal uses the latest promoted fine-tuned model.",
     "trigger_key": "Restarting the listener applies this key.",
     "confirm_key": "This key confirms the preview popup.",
     "cancel_key": "This key cancels the preview popup and leaves Delete free for editing.",
@@ -148,7 +160,7 @@ SETTING_HINTS = {
     "auto_train_time": "24-hour local time, for example 04:00.",
     "auto_train_max_minutes": "Training is stopped after this wall-clock limit.",
     "auto_train_max_epochs": "Training is also stopped after this many passes over corrected samples.",
-    "auto_promote_model": "Switches Voxtype to the new model after a successful smoke test.",
+    "auto_promote_model": "Updates the stable personal model after a successful smoke test.",
     "training_python_path": "Python executable from a conda env with torch, transformers, peft, and soundfile.",
 }
 
@@ -204,6 +216,10 @@ CHOICE_SETTINGS = {
         "zh": "Chinese only",
         "en": "English only",
         "auto": "Auto all languages",
+    },
+    "recognition_model_mode": {
+        "base": "Original large-v3-turbo",
+        "personal": "Personal fine-tuned model",
     },
     "trigger_key": TRIGGER_KEY_CHOICES,
     "confirm_key": PREVIEW_KEY_CHOICES,
@@ -272,7 +288,10 @@ def load_settings():
             raw = json.load(handle)
     except (OSError, json.JSONDecodeError):
         raw = {}
-    return normalize_settings(raw)
+    settings = normalize_settings(raw)
+    if not isinstance(raw, dict) or "recognition_model_mode" not in raw:
+        settings["recognition_model_mode"] = infer_recognition_model_mode()
+    return settings
 
 
 def save_settings(settings):
@@ -310,7 +329,7 @@ def update_toml_key(path, section, key, value_literal):
                 inserted = True
             in_section = stripped == section_header
 
-        if in_section and stripped.startswith(f"{key} "):
+        if in_section and re.match(rf"^{re.escape(key)}\s*=", stripped):
             new_line = f"{key} = {value_literal}\n"
             output.append(new_line)
             changed = changed or line != new_line
@@ -333,6 +352,122 @@ def update_toml_key(path, section, key, value_literal):
         handle.writelines(output)
     os.replace(tmp_path, path)
     return True
+
+
+def remove_toml_key(path, section, key):
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            lines = handle.readlines()
+    except OSError:
+        return False
+
+    section_header = f"[{section}]"
+    in_section = False
+    changed = False
+    output = []
+
+    for line in lines:
+        stripped = line.strip()
+        if stripped.startswith("[") and stripped.endswith("]"):
+            in_section = stripped == section_header
+        if in_section and re.match(rf"^{re.escape(key)}\s*=", stripped):
+            changed = True
+            continue
+        output.append(line)
+
+    if not changed:
+        return False
+
+    fd, tmp_path = tempfile.mkstemp(
+        prefix=".config-", suffix=".toml", dir=os.path.dirname(path)
+    )
+    with os.fdopen(fd, "w", encoding="utf-8") as handle:
+        handle.writelines(output)
+    os.replace(tmp_path, path)
+    return True
+
+
+def current_toml_key(path, section, key):
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            lines = handle.readlines()
+    except OSError:
+        return None
+
+    section_header = f"[{section}]"
+    in_section = False
+    for line in lines:
+        stripped = line.strip()
+        if stripped.startswith("[") and stripped.endswith("]"):
+            in_section = stripped == section_header
+            continue
+        if in_section and re.match(rf"^{re.escape(key)}\s*=", stripped):
+            return stripped.split("=", 1)[1].strip().strip('"')
+    return None
+
+
+def infer_recognition_model_mode():
+    current = current_toml_key(VOXTYPE_CONFIG_PATH, "whisper", "model")
+    if current == PERSONAL_MODEL_PATH:
+        return "personal"
+    return DEFAULT_SETTINGS["recognition_model_mode"]
+
+
+def recognition_model_literal(settings):
+    mode = settings.get("recognition_model_mode", DEFAULT_SETTINGS["recognition_model_mode"])
+    if mode == "personal":
+        return json.dumps(PERSONAL_MODEL_PATH), None
+    return json.dumps(BASE_VOXTYPE_MODEL), None
+
+
+def validate_recognition_model_mode(settings):
+    if settings.get("recognition_model_mode") != "personal":
+        return None
+    if os.path.isfile(PERSONAL_MODEL_PATH):
+        return None
+    return f"Personal model is missing: {PERSONAL_MODEL_PATH}"
+
+
+def backup_initial_prompt():
+    prompt = current_toml_key(VOXTYPE_CONFIG_PATH, "whisper", "initial_prompt")
+    if not prompt:
+        return
+    backup = os.path.expanduser(INITIAL_PROMPT_BACKUP_PATH)
+    if os.path.exists(backup):
+        return
+    os.makedirs(os.path.dirname(backup), exist_ok=True)
+    with open(backup, "w", encoding="utf-8") as handle:
+        handle.write(prompt + "\n")
+
+
+def restore_initial_prompt_if_available():
+    if current_toml_key(VOXTYPE_CONFIG_PATH, "whisper", "initial_prompt"):
+        return False
+    backup = os.path.expanduser(INITIAL_PROMPT_BACKUP_PATH)
+    try:
+        with open(backup, "r", encoding="utf-8") as handle:
+            prompt = handle.read().strip()
+    except OSError:
+        return False
+    if not prompt:
+        return False
+    return update_toml_key(VOXTYPE_CONFIG_PATH, "whisper", "initial_prompt", json.dumps(prompt))
+
+
+def apply_voxtype_model(settings):
+    value_literal, _error = recognition_model_literal(settings)
+    mode = settings.get("recognition_model_mode", DEFAULT_SETTINGS["recognition_model_mode"])
+    changed = update_toml_key(VOXTYPE_CONFIG_PATH, "whisper", "model", value_literal)
+    changed = remove_toml_key(VOXTYPE_CONFIG_PATH, "whisper", "mode") or changed
+    changed = remove_toml_key(VOXTYPE_CONFIG_PATH, "whisper", "whisper_cli_path") or changed
+    if mode == "personal":
+        backup_initial_prompt()
+        changed = remove_toml_key(VOXTYPE_CONFIG_PATH, "whisper", "initial_prompt") or changed
+    else:
+        changed = restore_initial_prompt_if_available() or changed
+    if changed:
+        systemctl("restart", "voxtype.service")
+    return changed
 
 
 def apply_voxtype_language(settings):
@@ -415,7 +550,6 @@ class SettingsDialog(Gtk.Dialog):
     def __init__(self):
         super().__init__(title="Voxpress Settings")
         self.set_default_size(560, 700)
-        self.set_keep_above(True)
         self.controls = {}
         self.settings = load_settings()
 
@@ -450,6 +584,8 @@ class SettingsDialog(Gtk.Dialog):
         self.add_check(grid, row, "append_newline")
         row += 1
         self.add_choice(grid, row, "language_mode")
+        row += 1
+        self.add_choice(grid, row, "recognition_model_mode")
         row += 1
         self.add_choice(grid, row, "trigger_key")
         row += 1
@@ -674,38 +810,50 @@ class VoxtypeIndicator:
 
         dialog = SettingsDialog()
         self.settings_dialog = dialog
-        while True:
-            response = dialog.run()
-            if response == 1001:
-                dialog.reset_defaults()
-                continue
-            if response == Gtk.ResponseType.OK:
-                old_settings = load_settings()
-                settings = save_settings(dialog.collect())
-                language_changed = apply_voxtype_language(settings)
-                trigger_changed = settings["trigger_key"] != old_settings["trigger_key"]
-                preview_key_changed = (
-                    settings["confirm_key"] != old_settings["confirm_key"]
-                    or settings["cancel_key"] != old_settings["cancel_key"]
-                )
-                listener_restarted = False
-                if trigger_changed:
-                    result = systemctl("restart", SERVICE)
-                    listener_restarted = result.returncode == 0
-                    if result.returncode != 0:
-                        notify("Voxpress listener restart failed", result.stderr.strip())
-                hide_popup()
-                body = "New popup settings apply on the next popup."
-                if language_changed:
-                    body += " Voxtype was restarted for the language change."
-                if listener_restarted:
-                    body += " Listener was restarted for the hold-to-talk key change."
-                elif preview_key_changed:
-                    body += " Preview key changes apply on the next preview."
-                notify("Voxpress settings saved", body)
-            break
+        dialog.connect("response", self.on_settings_response)
+        dialog.present()
+
+    def on_settings_response(self, dialog, response):
+        if response == 1001:
+            dialog.reset_defaults()
+            return
+
+        if response == Gtk.ResponseType.OK:
+            old_settings = load_settings()
+            collected = dialog.collect()
+            model_error = validate_recognition_model_mode(collected)
+            if model_error:
+                notify("Voxpress model switch failed", model_error)
+                return
+            settings = save_settings(collected)
+            model_changed = apply_voxtype_model(settings)
+            language_changed = apply_voxtype_language(settings)
+            trigger_changed = settings["trigger_key"] != old_settings["trigger_key"]
+            preview_key_changed = (
+                settings["confirm_key"] != old_settings["confirm_key"]
+                or settings["cancel_key"] != old_settings["cancel_key"]
+            )
+            listener_restarted = False
+            if trigger_changed:
+                result = systemctl("restart", SERVICE)
+                listener_restarted = result.returncode == 0
+                if result.returncode != 0:
+                    notify("Voxpress listener restart failed", result.stderr.strip())
+            hide_popup()
+            body = "New popup settings apply on the next popup."
+            if model_changed:
+                body += " Voxtype was restarted for the model change."
+            if language_changed:
+                body += " Voxtype was restarted for the language change."
+            if listener_restarted:
+                body += " Listener was restarted for the hold-to-talk key change."
+            elif preview_key_changed:
+                body += " Preview key changes apply on the next preview."
+            notify("Voxpress settings saved", body)
+
         dialog.destroy()
-        self.settings_dialog = None
+        if self.settings_dialog is dialog:
+            self.settings_dialog = None
 
     def quit(self, *_args):
         Gtk.main_quit()

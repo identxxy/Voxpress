@@ -79,10 +79,16 @@ Project-level guidance for agents working on Voxpress.
     threshold 4096 MB.
   - Trains only on corrected samples. There is no held-out evaluation set.
   - Promotes only deployable local whisper.cpp/GGML model artifacts.
-  - Promotion writes `[whisper].model` in `~/.config/voxtype/config.toml` and
-    removes experimental `mode = "cli"` / `whisper_cli_path` keys.
-  - Promotion first smoke-tests through Voxtype local mode and rejects empty or
-    degenerate outputs.
+  - Promotion always refreshes the stable personal model artifact. It writes
+    `[whisper].model` in `~/.config/voxtype/config.toml` only when
+    `recognition_model_mode` is `personal`; if the GUI is set to `base`, live
+    recognition remains on the original model.
+  - Promotion first runs a Voxtype local quality gate on recent corrected
+    samples. It rejects empty/degenerate outputs and rejects models that are not
+    better than the original baseline on those samples.
+  - Candidate personal-model smoke tests remove `[whisper].initial_prompt`.
+    Personal GGML artifacts can be dominated by the base model's long prompt on
+    short utterances even when the merged Hugging Face model is good.
   - The promoted model is copied to
     `~/.local/share/voxpress/models/current/voxpress-personal-whisper.bin`.
     Timestamped run directories are temporary and are pruned after successful
@@ -91,6 +97,10 @@ Project-level guidance for agents working on Voxpress.
 - `bin/voxpress-train-whisper-lora`
   - Fine-tunes a LoRA adapter from corrected samples.
   - Default base model is `openai/whisper-large-v3-turbo`.
+  - Default training language mode is `zh_en`; pure-English corrected text gets
+    English decoder prompt tokens, while CJK text gets Chinese prompt tokens.
+  - Default LoRA strategy is rank 32, alpha 64, dropout 0, target modules
+    `q_proj,k_proj,v_proj,out_proj`, and learning rate `1e-4`.
   - Uses `torch`, `transformers`, `peft`, and `soundfile`.
   - Training stops when either `--max-minutes` or `--max-epochs` is reached.
     The epoch cap prevents tiny correction sets from replaying for the whole
@@ -126,6 +136,10 @@ Project-level guidance for agents working on Voxpress.
   - Settings dialog writes `~/.config/voxpress/settings.json`.
   - Language changes update `~/.config/voxtype/config.toml` and restart
     `voxtype.service`.
+  - Recognition model changes switch between the original base model and the
+    stable personal model. Switching to personal backs up and removes
+    `[whisper].initial_prompt`; switching back to base restores the backup when
+    the prompt is missing.
   - Hold-to-talk key changes restart `voxpress-pause-listener.service`.
 
 ## Dependencies
@@ -243,6 +257,8 @@ Daily scheduler and promotion:
 - `VOXPRESS_AUTO_TRAIN_MAX_EPOCHS`: corrected-sample replay cap.
 - `VOXPRESS_AUTO_PROMOTE_MODEL`: enable/disable automatic promotion after a
   deployable train result.
+- `VOXPRESS_RECOGNITION_MODEL_MODE`: `base` or `personal`; controls whether
+  promotion switches live Voxtype inference to the personal model.
 - `VOXPRESS_GPU_CHECK_COUNT`: number of idle checks before training.
 - `VOXPRESS_GPU_CHECK_INTERVAL_SECONDS`: delay between idle checks.
 - `VOXPRESS_GPU_BUSY_UTILIZATION_PERCENT`: GPU utilization busy threshold.
@@ -252,11 +268,19 @@ Daily scheduler and promotion:
   `~/.local/share/voxpress/models/runs`.
 - `VOXPRESS_CURRENT_MODEL_PATH`: stable promoted GGML model path; defaults to
   `~/.local/share/voxpress/models/current/voxpress-personal-whisper.bin`.
+- `VOXPRESS_INITIAL_PROMPT_BACKUP`: path used to store the base model
+  `[whisper].initial_prompt` while live recognition is switched to personal.
 - `VOXPRESS_TRAIN_PYTHON`: Python executable for training/export.
 - `VOXPRESS_TRAIN_COMMAND`: custom training command template. Supported fields
   are `{manifest}`, `{output_dir}`, `{max_minutes}`, and `{max_epochs}`.
 - `VOXPRESS_DAILY_TRAIN_WATCHDOG_SECONDS`: optional scheduler-level watchdog.
 - `VOXPRESS_MODEL_SMOKE_TIMEOUT_SECONDS`: Voxtype model smoke-test timeout.
+- `VOXPRESS_MODEL_GATE_SAMPLE_COUNT`: number of recent corrected samples used
+  for the promotion quality gate; default 5.
+- `VOXPRESS_MODEL_GATE_MAX_ERROR`: maximum average normalized character error
+  allowed for the candidate model; default 0.60.
+- `VOXPRESS_MODEL_GATE_MIN_IMPROVEMENT`: required average error improvement
+  over the original baseline; default 0.02.
 - `VOXPRESS_SKIP_MODEL_SMOKE_TEST`: test-only escape hatch; do not use for
   real promotion unless the caller deliberately accepts bad-model risk.
 - `VOXPRESS_VOXTYPE_BIN`: Voxtype CLI path used by the smoke test.
@@ -268,15 +292,19 @@ Daily scheduler and promotion:
 LoRA training:
 
 - `VOXPRESS_BASE_WHISPER_MODEL`: Hugging Face base model.
-- `VOXPRESS_TRAIN_LANGUAGE`: Whisper processor language; default `zh`.
+- `VOXPRESS_TRAIN_LANGUAGE`: Whisper processor language mode; default `zh_en`.
 - `VOXPRESS_TRAIN_MAX_EPOCHS`: direct trainer default when the scheduler does
   not pass `--max-epochs`.
-- `VOXPRESS_TRAIN_MAX_STEPS`: trainer step cap.
+- `VOXPRESS_TRAIN_MAX_STEPS`: trainer step cap; default 1000. Epoch and
+  wall-clock limits usually stop training first.
 - `VOXPRESS_TRAIN_BATCH_SIZE`: microbatch size.
 - `VOXPRESS_TRAIN_GRAD_ACCUM`: gradient accumulation steps.
-- `VOXPRESS_TRAIN_LR`: AdamW learning rate.
+- `VOXPRESS_TRAIN_LR`: AdamW learning rate; default `1e-4`.
 - `VOXPRESS_LORA_RANK`: LoRA rank.
 - `VOXPRESS_LORA_ALPHA`: LoRA alpha.
+- `VOXPRESS_LORA_DROPOUT`: LoRA dropout; default `0.0`.
+- `VOXPRESS_LORA_TARGET_MODULES`: comma-separated module names; default
+  `q_proj,k_proj,v_proj,out_proj`.
 - `VOXPRESS_EXPORT_TIMEOUT_SECONDS`: optional exporter subprocess timeout.
 - `VOXPRESS_DRY_RUN_DEPLOY_MODEL`: dry-run trainer output marker path for
   tests; marker artifacts are intentionally not promotable.
@@ -323,12 +351,15 @@ Data flow:
   model, converts the merged model to whisper.cpp/GGML, optionally applies an
   explicitly validated quantizer, and reports `deploy_model_path` as JSON.
 - The scheduler promotes only real local whisper.cpp/GGML artifacts. It rejects
-  dry-run wrapper markers, missing files, empty smoke output, and degenerate
-  repeated-token smoke output.
-- Promotion copies the deploy artifact to the stable current-model path, updates
-  `[whisper].model` in the Voxtype config, removes experimental
-  `[whisper].mode` / `whisper_cli_path` keys, restarts `voxtype.service`, records
-  promotion metadata, and prunes large run artifacts.
+  dry-run wrapper markers, missing files, empty/degenerate outputs, and models
+  that fail the corrected-sample quality gate against the original baseline.
+- Promotion copies the deploy artifact to the stable current-model path. It
+  updates `[whisper].model`, removes experimental `[whisper].mode` /
+  `whisper_cli_path` keys, backs up and removes `[whisper].initial_prompt`, and
+  restarts `voxtype.service` only when `recognition_model_mode` is `personal`.
+  When the setting is `base`, the personal model is updated but live inference
+  stays on the original model. Promotion also records metadata and prunes large
+  run artifacts.
 
 Default data paths:
 
@@ -358,6 +389,8 @@ Training run contents:
 
 - `train-manifest.json`: snapshot of selected correction samples.
 - `train.stdout.log` / `train.stderr.log`: scheduler-captured trainer logs.
+- `train-metrics.jsonl`: per-step training metrics with average loss, total
+  accumulated loss, microbatch count, and sample count.
 - `adapter/`: PEFT LoRA adapter, temporary after successful promotion.
 - `processor/`: matching Whisper processor, temporary after successful
   promotion.
@@ -368,8 +401,10 @@ Training run contents:
   `deploy/whisper-cpp-convert.stderr.log`: converter logs.
 - `deploy/custom-export.stdout.log` and `deploy/custom-export.stderr.log`:
   custom exporter logs when `VOXPRESS_WHISPER_EXPORT_COMMAND` is used.
-- `model-smoke.config.toml`, `model-smoke.stdout.log`,
-  `model-smoke.stderr.log`: promotion smoke-test artifacts.
+- `candidate-smoke.config.toml` / `base-smoke.config.toml` plus numbered
+  stdout/stderr logs: promotion quality-gate transcription artifacts.
+- `model-quality-gate.json`: corrected-sample promotion gate result comparing
+  candidate and baseline transcriptions.
 - `train-result.json`: source of truth for train/export/promotion result.
 
 ## Settings Schema
@@ -383,6 +418,7 @@ Important keys:
 - `cancel_key`: default `Scroll_Lock`, displayed as Scroll Lock.
 - `append_newline`: default true.
 - `language_mode`: one of `zh_en`, `zh`, `en`, `auto`.
+- `recognition_model_mode`: `base` or `personal`; default `base`.
 - `correction_collection_enabled`: default true.
 - `correction_max_storage_mb`: default 256.
 - `correction_max_samples`: default 1000.
@@ -457,8 +493,12 @@ Key names are X11/GDK key names, not arbitrary labels. Existing aliases:
   correction set, replaying the same edits for the full wall-clock budget can
   overfit or destabilize the adapter.
 - The current pipeline has no held-out evaluation set. Promotion quality is
-  protected only by a deployability check plus a real Voxtype smoke test on a
-  correction sample.
+  protected by a training-set sanity gate: recent corrected samples are
+  transcribed by both the candidate model and the original baseline, and the
+  candidate must be better by a small margin.
+- The candidate side of the quality gate intentionally removes
+  `[whisper].initial_prompt`. The original prompt improves base-model term bias,
+  but it can make a short fine-tuned GGML transcription empty or prompt-led.
 - Export/package conversion has no default timeout. Use
   `VOXPRESS_EXPORT_TIMEOUT_SECONDS` or `VOXPRESS_DAILY_TRAIN_WATCHDOG_SECONDS`
   only as operational watchdogs.

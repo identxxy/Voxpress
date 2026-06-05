@@ -15,6 +15,7 @@
   "vertical_fraction": 0.75,
   "append_newline": true,
   "language_mode": "zh_en",
+  "recognition_model_mode": "base",
   "trigger_key": "Pause",
   "confirm_key": "Return",
   "cancel_key": "Scroll_Lock",

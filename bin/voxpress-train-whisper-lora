@@ -2,9 +2,11 @@
 import argparse
 import json
 import os
+import re
 import subprocess
 import sys
 import time
+import unicodedata
 from pathlib import Path
 
 
@@ -89,6 +91,58 @@ def sample_presentation_limit(sample_count, max_epochs):
     return max(1, sample_count) * max(1, max_epochs)
 
 
+def parse_lora_target_modules(raw):
+    modules = [module.strip() for module in str(raw or "").split(",") if module.strip()]
+    return modules or ["q_proj", "k_proj", "v_proj", "out_proj"]
+
+
+def has_cjk(text):
+    return any(
+        "\u3400" <= character <= "\u9fff"
+        for character in str(text or "")
+    )
+
+
+def normalize_language_mode(language):
+    value = str(language or "zh_en").strip().lower().replace("-", "_")
+    if value in {"zh", "chinese"}:
+        return "zh"
+    if value in {"en", "english"}:
+        return "en"
+    if value in {"auto", "zh_en", "zh+en", "zh,en"}:
+        return "zh_en"
+    return value
+
+
+def tokenizer_language_for_text(text, language_mode):
+    mode = normalize_language_mode(language_mode)
+    if mode == "zh_en":
+        return "zh" if has_cjk(text) else "en"
+    return mode
+
+
+def processor_default_language(language_mode):
+    mode = normalize_language_mode(language_mode)
+    if mode == "zh_en":
+        return "zh"
+    return mode
+
+
+def summarize_loss_metrics(metrics):
+    if not metrics:
+        return {"steps": 0}
+    losses = [metric["loss_avg"] for metric in metrics]
+    return {
+        "steps": len(metrics),
+        "samples_seen": metrics[-1]["samples_seen"],
+        "initial_loss_avg": losses[0],
+        "final_loss_avg": losses[-1],
+        "min_loss_avg": min(losses),
+        "max_loss_avg": max(losses),
+        "mean_loss_avg": sum(losses) / len(losses),
+    }
+
+
 def run_real(args):
     if not require_training_dependencies():
         return 2
@@ -108,7 +162,11 @@ def run_real(args):
         return 1
 
     model_name = args.base_model
-    processor = WhisperProcessor.from_pretrained(model_name, language=args.language, task="transcribe")
+    processor = WhisperProcessor.from_pretrained(
+        model_name,
+        language=processor_default_language(args.language),
+        task="transcribe",
+    )
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
     dtype = torch.float32
     model = WhisperForConditionalGeneration.from_pretrained(model_name, torch_dtype=dtype)
@@ -119,8 +177,8 @@ def run_real(args):
     lora = LoraConfig(
         r=args.lora_rank,
         lora_alpha=args.lora_alpha,
-        target_modules=["q_proj", "v_proj"],
-        lora_dropout=0.05,
+        target_modules=parse_lora_target_modules(args.lora_target_modules),
+        lora_dropout=args.lora_dropout,
         bias="none",
     )
     model = get_peft_model(model, lora)
@@ -138,6 +196,8 @@ def run_real(args):
         input_features = processor.feature_extractor(
             audio_array, sampling_rate=sampling_rate
         ).input_features[0]
+        label_language = tokenizer_language_for_text(sample["text"], args.language)
+        processor.tokenizer.set_prefix_tokens(language=label_language, task="transcribe")
         labels = processor.tokenizer(sample["text"]).input_ids
         return {"input_features": input_features, "labels": labels}
 
@@ -153,6 +213,9 @@ def run_real(args):
         return batch
 
     output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    metrics_path = output_dir / "train-metrics.jsonl"
+    metrics = []
     optimizer = torch.optim.AdamW(
         [parameter for parameter in model.parameters() if parameter.requires_grad],
         lr=args.learning_rate,
@@ -162,51 +225,67 @@ def run_real(args):
     samples_seen = 0
     sample_limit = sample_presentation_limit(len(prepared), args.max_epochs)
     train_deadline = time.monotonic() + max(1, args.max_minutes) * 60
-    for step in range(args.max_steps):
-        if sample_limit is not None and samples_seen >= sample_limit:
-            print(f"Stopping training at max_epochs={args.max_epochs}", flush=True)
-            break
-        if step > 0 and time.monotonic() >= train_deadline:
-            print(f"Stopping training at max_minutes={args.max_minutes}", flush=True)
-            break
-        optimizer.zero_grad(set_to_none=True)
-        total_loss = 0.0
-        accumulated = 0
-        for _ in range(max(1, args.gradient_accumulation_steps)):
+    with metrics_path.open("w", encoding="utf-8") as metrics_handle:
+        for step in range(args.max_steps):
             if sample_limit is not None and samples_seen >= sample_limit:
+                print(f"Stopping training at max_epochs={args.max_epochs}", flush=True)
                 break
-            batch_items = []
-            for _batch_index in range(max(1, args.batch_size)):
+            if step > 0 and time.monotonic() >= train_deadline:
+                print(f"Stopping training at max_minutes={args.max_minutes}", flush=True)
+                break
+            optimizer.zero_grad(set_to_none=True)
+            total_loss = 0.0
+            accumulated = 0
+            for _ in range(max(1, args.gradient_accumulation_steps)):
                 if sample_limit is not None and samples_seen >= sample_limit:
                     break
-                batch_items.append(prepared[sample_index % len(prepared)])
-                sample_index += 1
-                samples_seen += 1
-            if not batch_items:
+                batch_items = []
+                for _batch_index in range(max(1, args.batch_size)):
+                    if sample_limit is not None and samples_seen >= sample_limit:
+                        break
+                    batch_items.append(prepared[sample_index % len(prepared)])
+                    sample_index += 1
+                    samples_seen += 1
+                if not batch_items:
+                    break
+                batch = collate(batch_items)
+                batch = {
+                    key: value.to(device)
+                    for key, value in batch.items()
+                }
+                batch["input_features"] = batch["input_features"].to(dtype=dtype)
+                loss = model(**batch).loss / max(1, args.gradient_accumulation_steps)
+                if not torch.isfinite(loss):
+                    raise RuntimeError(f"Non-finite training loss at step {step + 1}: {loss}")
+                loss.backward()
+                total_loss += float(loss.detach().cpu()) * max(1, args.gradient_accumulation_steps)
+                accumulated += 1
+            if accumulated == 0:
                 break
-            batch = collate(batch_items)
-            batch = {
-                key: value.to(device)
-                for key, value in batch.items()
+            torch.nn.utils.clip_grad_norm_(
+                [parameter for parameter in model.parameters() if parameter.requires_grad],
+                max_norm=1.0,
+            )
+            optimizer.step()
+            for name, parameter in model.named_parameters():
+                if parameter.requires_grad and not torch.isfinite(parameter).all():
+                    raise RuntimeError(f"Non-finite trainable parameter after step {step + 1}: {name}")
+            loss_avg = total_loss / max(1, accumulated)
+            metric = {
+                "step": step + 1,
+                "loss_avg": loss_avg,
+                "loss_total": total_loss,
+                "microbatches": accumulated,
+                "samples_seen": samples_seen,
             }
-            batch["input_features"] = batch["input_features"].to(dtype=dtype)
-            loss = model(**batch).loss / max(1, args.gradient_accumulation_steps)
-            if not torch.isfinite(loss):
-                raise RuntimeError(f"Non-finite training loss at step {step + 1}: {loss}")
-            loss.backward()
-            total_loss += float(loss.detach().cpu()) * max(1, args.gradient_accumulation_steps)
-            accumulated += 1
-        if accumulated == 0:
-            break
-        torch.nn.utils.clip_grad_norm_(
-            [parameter for parameter in model.parameters() if parameter.requires_grad],
-            max_norm=1.0,
-        )
-        optimizer.step()
-        for name, parameter in model.named_parameters():
-            if parameter.requires_grad and not torch.isfinite(parameter).all():
-                raise RuntimeError(f"Non-finite trainable parameter after step {step + 1}: {name}")
-        print(f"step={step + 1} loss={total_loss:.6f} samples_seen={samples_seen}", flush=True)
+            metrics.append(metric)
+            metrics_handle.write(json.dumps(metric, ensure_ascii=False, sort_keys=True) + "\n")
+            metrics_handle.flush()
+            print(
+                f"step={step + 1} loss_avg={loss_avg:.6f} "
+                f"loss_total={total_loss:.6f} samples_seen={samples_seen}",
+                flush=True,
+            )
 
     adapter_dir = output_dir / "adapter"
     model.save_pretrained(adapter_dir)
@@ -229,6 +308,20 @@ def run_real(args):
             "deploy_ready": bool(deploy_model_path),
             "deploy_reason": export_result.get("reason", export_result.get("status")),
             "export_result": export_result,
+            "train_metrics_path": str(metrics_path),
+            "train_metrics_summary": summarize_loss_metrics(metrics),
+            "train_config": {
+                "base_model": args.base_model,
+                "language": args.language,
+                "learning_rate": args.learning_rate,
+                "lora_rank": args.lora_rank,
+                "lora_alpha": args.lora_alpha,
+                "lora_dropout": args.lora_dropout,
+                "lora_target_modules": parse_lora_target_modules(args.lora_target_modules),
+                "batch_size": args.batch_size,
+                "gradient_accumulation_steps": args.gradient_accumulation_steps,
+                "max_steps": args.max_steps,
+            },
             "max_epochs": args.max_epochs,
             "sample_count": len(samples),
         },
@@ -283,13 +376,18 @@ def main():
     parser.add_argument("--max-minutes", type=int, default=30)
     parser.add_argument("--max-epochs", type=int, default=int(os.environ.get("VOXPRESS_TRAIN_MAX_EPOCHS", "5")))
     parser.add_argument("--base-model", default=os.environ.get("VOXPRESS_BASE_WHISPER_MODEL", "openai/whisper-large-v3-turbo"))
-    parser.add_argument("--language", default=os.environ.get("VOXPRESS_TRAIN_LANGUAGE", "zh"))
-    parser.add_argument("--max-steps", type=int, default=int(os.environ.get("VOXPRESS_TRAIN_MAX_STEPS", "100")))
+    parser.add_argument("--language", default=os.environ.get("VOXPRESS_TRAIN_LANGUAGE", "zh_en"))
+    parser.add_argument("--max-steps", type=int, default=int(os.environ.get("VOXPRESS_TRAIN_MAX_STEPS", "1000")))
     parser.add_argument("--batch-size", type=int, default=int(os.environ.get("VOXPRESS_TRAIN_BATCH_SIZE", "1")))
     parser.add_argument("--gradient-accumulation-steps", type=int, default=int(os.environ.get("VOXPRESS_TRAIN_GRAD_ACCUM", "8")))
-    parser.add_argument("--learning-rate", type=float, default=float(os.environ.get("VOXPRESS_TRAIN_LR", "1e-5")))
-    parser.add_argument("--lora-rank", type=int, default=int(os.environ.get("VOXPRESS_LORA_RANK", "16")))
-    parser.add_argument("--lora-alpha", type=int, default=int(os.environ.get("VOXPRESS_LORA_ALPHA", "32")))
+    parser.add_argument("--learning-rate", type=float, default=float(os.environ.get("VOXPRESS_TRAIN_LR", "1e-4")))
+    parser.add_argument("--lora-rank", type=int, default=int(os.environ.get("VOXPRESS_LORA_RANK", "32")))
+    parser.add_argument("--lora-alpha", type=int, default=int(os.environ.get("VOXPRESS_LORA_ALPHA", "64")))
+    parser.add_argument("--lora-dropout", type=float, default=float(os.environ.get("VOXPRESS_LORA_DROPOUT", "0.0")))
+    parser.add_argument(
+        "--lora-target-modules",
+        default=os.environ.get("VOXPRESS_LORA_TARGET_MODULES", "q_proj,k_proj,v_proj,out_proj"),
+    )
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--check-deps", action="store_true")
     args = parser.parse_args()

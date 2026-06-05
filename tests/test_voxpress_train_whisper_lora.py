@@ -43,6 +43,47 @@ class VoxpressTrainWhisperLoraTest(unittest.TestCase):
         self.assertEqual(module.sample_presentation_limit(sample_count=100, max_epochs=5), 500)
         self.assertIsNone(module.sample_presentation_limit(sample_count=2, max_epochs=0))
 
+    def test_summarize_loss_metrics_uses_average_loss(self):
+        loader = importlib.machinery.SourceFileLoader(
+            "voxpress_train_whisper_lora_metrics_test", str(SCRIPT)
+        )
+        spec = importlib.util.spec_from_loader(loader.name, loader)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+
+        summary = module.summarize_loss_metrics(
+            [
+                {"loss_avg": 2.0, "samples_seen": 8},
+                {"loss_avg": 1.0, "samples_seen": 16},
+            ]
+        )
+
+        self.assertEqual(summary["steps"], 2)
+        self.assertEqual(summary["initial_loss_avg"], 2.0)
+        self.assertEqual(summary["final_loss_avg"], 1.0)
+        self.assertEqual(summary["mean_loss_avg"], 1.5)
+        self.assertEqual(summary["samples_seen"], 16)
+
+    def test_lora_targets_and_language_mode_defaults(self):
+        loader = importlib.machinery.SourceFileLoader(
+            "voxpress_train_whisper_lora_config_test", str(SCRIPT)
+        )
+        spec = importlib.util.spec_from_loader(loader.name, loader)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+
+        self.assertEqual(
+            module.parse_lora_target_modules("q_proj, k_proj,v_proj,out_proj"),
+            ["q_proj", "k_proj", "v_proj", "out_proj"],
+        )
+        self.assertEqual(
+            module.parse_lora_target_modules(""),
+            ["q_proj", "k_proj", "v_proj", "out_proj"],
+        )
+        self.assertEqual(module.tokenizer_language_for_text("hello world", "zh_en"), "en")
+        self.assertEqual(module.tokenizer_language_for_text("你好 world", "zh_en"), "zh")
+        self.assertEqual(module.processor_default_language("zh_en"), "zh")
+
 
 if __name__ == "__main__":
     unittest.main()

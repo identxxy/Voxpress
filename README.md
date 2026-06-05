@@ -125,6 +125,7 @@ Defaults can be changed from the tray menu:
 
 - hold-to-talk, confirm, and cancel keys
 - language mode
+- original vs personal fine-tuned recognition model
 - preview size, position, opacity, and text size
 - append-newline behavior
 - correction storage and daily training settings
@@ -135,17 +136,18 @@ Defaults can be changed from the tray menu:
 Personal training is optional. The short version is:
 
 ```text
-edited preview corrections -> daily LoRA -> GGML export -> smoke test -> stable current model
+edited preview corrections -> daily LoRA -> GGML export -> quality gate -> stable current model
 ```
 
 Only manually edited and confirmed preview samples are saved. Daily training can
 fine-tune a LoRA adapter from those corrections, merge it into the base Whisper
-model, export a whisper.cpp/GGML artifact, smoke-test it through Voxtype local
-mode, and promote it only if the test output looks usable.
+model, export a whisper.cpp/GGML artifact, test it through Voxtype local mode on
+recent corrected samples, and promote it only if it beats the original
+`large-v3-turbo` baseline.
 
 By default, corrected audio is capped at `256 MB`; training is capped by both
-`30` minutes and `5` epochs; and successful promotion replaces one stable model
-at:
+`30` minutes and `5` epochs; and successful promotion replaces one stable
+personal model at:
 
 ```text
 ~/.local/share/voxpress/models/current/voxpress-personal-whisper.bin
@@ -154,10 +156,25 @@ at:
 Timestamped training run directories are temporary workspaces and are pruned
 after promotion, so Voxpress does not keep one full model per day.
 
+The tray settings can switch live recognition between the original
+`large-v3-turbo` model and the stable personal model. If the original model is
+selected, daily training may still update the personal model file, but it will
+not silently take over live recognition.
+
+When the personal model is selected, Voxpress removes the original model's
+`initial_prompt` from live Voxtype config and keeps a small backup for switching
+back. The prompt is useful for the base model, but it can dominate short
+utterances from the fine-tuned GGML model.
+
+Training logs include `train-metrics.jsonl` with per-step average loss. Promotion
+also writes `model-quality-gate.json`, comparing the exported personal model
+against the original model on recent corrected samples.
+
 Useful settings in `~/.config/voxpress/settings.json`:
 
 - `correction_collection_enabled`
 - `correction_max_storage_mb`
+- `recognition_model_mode`
 - `auto_train_enabled`
 - `auto_train_time`
 - `auto_train_max_minutes`

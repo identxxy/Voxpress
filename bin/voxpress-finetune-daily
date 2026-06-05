@@ -19,6 +19,7 @@ DEFAULT_SETTINGS_PATH = os.path.expanduser("~/.config/voxpress/settings.json")
 DEFAULT_CORRECTION_DIR = os.path.expanduser("~/.local/share/voxpress/corrections")
 DEFAULT_RUNS_DIR = os.path.expanduser("~/.local/share/voxpress/models/runs")
 DEFAULT_VOXTYPE_CONFIG = os.path.expanduser("~/.config/voxtype/config.toml")
+DEFAULT_INITIAL_PROMPT_BACKUP = os.path.expanduser("~/.config/voxpress/base-initial-prompt.txt")
 
 
 def print_json(payload):
@@ -49,6 +50,14 @@ def int_setting(settings, env_key, settings_key, default):
         return default
 
 
+def float_setting(settings, env_key, settings_key, default):
+    raw = os.environ.get(env_key, settings.get(settings_key, default))
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        return default
+
+
 def optional_timeout_env(env_key):
     raw = os.environ.get(env_key)
     if raw is None:
@@ -69,6 +78,15 @@ def bool_setting(settings, env_key, settings_key, default):
     return raw.strip().lower() in ("1", "true", "yes", "on")
 
 
+def recognition_model_mode(settings):
+    raw = os.environ.get(
+        "VOXPRESS_RECOGNITION_MODEL_MODE",
+        settings.get("recognition_model_mode", "base"),
+    )
+    value = str(raw or "base").strip().lower()
+    return value if value in {"base", "personal"} else "base"
+
+
 def correction_root():
     return Path(os.environ.get("VOXPRESS_CORRECTION_DIR", DEFAULT_CORRECTION_DIR))
 
@@ -82,6 +100,10 @@ def current_model_path():
     if configured:
         return Path(configured).expanduser()
     return runs_root().parent / "current" / "voxpress-personal-whisper.bin"
+
+
+def initial_prompt_backup_path():
+    return Path(os.environ.get("VOXPRESS_INITIAL_PROMPT_BACKUP", DEFAULT_INITIAL_PROMPT_BACKUP)).expanduser()
 
 
 def state_path():
@@ -328,6 +350,8 @@ def default_train_command(manifest, output_dir, max_minutes, max_epochs, setting
         str(max_minutes),
         "--max-epochs",
         str(max_epochs),
+        "--language",
+        str(settings.get("language_mode", "zh_en")),
     ]
 
 
@@ -390,7 +414,7 @@ def update_toml_key(path, section, key, value_literal):
                 inserted = True
             in_section = stripped == section_header
             saw_section = saw_section or in_section
-        if in_section and stripped.startswith(f"{key} "):
+        if in_section and re.match(rf"^{re.escape(key)}\s*=", stripped):
             output.append(f"{key} = {value_literal}\n")
             inserted = True
             continue
@@ -425,7 +449,7 @@ def remove_toml_key(path, section, key):
         stripped = line.strip()
         if stripped.startswith("[") and stripped.endswith("]"):
             in_section = stripped == section_header
-        if in_section and stripped.startswith(f"{key} "):
+        if in_section and re.match(rf"^{re.escape(key)}\s*=", stripped):
             continue
         output.append(line)
 
@@ -447,9 +471,21 @@ def current_toml_key(path, section, key):
         if stripped.startswith("[") and stripped.endswith("]"):
             in_section = stripped == f"[{section}]"
             continue
-        if in_section and stripped.startswith(f"{key} "):
+        if in_section and re.match(rf"^{re.escape(key)}\s*=", stripped):
             return stripped.split("=", 1)[1].strip().strip('"')
     return None
+
+
+def backup_initial_prompt(config_path):
+    prompt = current_toml_key(config_path, "whisper", "initial_prompt")
+    if not prompt:
+        return False
+    backup = initial_prompt_backup_path()
+    if backup.exists():
+        return False
+    backup.parent.mkdir(parents=True, exist_ok=True)
+    backup.write_text(prompt + "\n", encoding="utf-8")
+    return True
 
 
 def restart_voxtype():
@@ -466,6 +502,10 @@ def whisper_wrapper_path():
 
 def voxtype_bin():
     return os.environ.get("VOXPRESS_VOXTYPE_BIN", os.path.expanduser("~/.local/bin/voxtype"))
+
+
+def base_voxtype_model():
+    return os.environ.get("VOXPRESS_BASE_VOXTYPE_MODEL", "large-v3-turbo")
 
 
 def wrapper_marker(path):
@@ -488,17 +528,68 @@ def is_promotable_deploy_model(model_path):
     return True, "ok"
 
 
-def model_smoke_test(model_path, samples, output_dir):
-    if os.environ.get("VOXPRESS_SKIP_MODEL_SMOKE_TEST", "0") == "1":
-        return True, "skipped"
-    if not samples:
-        return False, "no_smoke_sample"
-    promotable, reason = is_promotable_deploy_model(model_path)
-    if not promotable:
-        return False, reason
+def normalize_for_quality_score(text):
+    normalized = unicodedata.normalize("NFKC", str(text or "")).lower()
+    return "".join(
+        character
+        for character in normalized
+        if unicodedata.category(character)[0] in {"L", "N"}
+    )
 
-    sample = samples[0]
-    smoke_config = write_smoke_config(model_path, output_dir)
+
+def edit_distance(left, right):
+    if left == right:
+        return 0
+    if not left:
+        return len(right)
+    if not right:
+        return len(left)
+    previous = list(range(len(right) + 1))
+    for left_index, left_character in enumerate(left, 1):
+        current = [left_index]
+        for right_index, right_character in enumerate(right, 1):
+            current.append(
+                min(
+                    previous[right_index] + 1,
+                    current[right_index - 1] + 1,
+                    previous[right_index - 1] + (left_character != right_character),
+                )
+            )
+        previous = current
+    return previous[-1]
+
+
+def transcription_error(reference, hypothesis):
+    normalized_reference = normalize_for_quality_score(reference)
+    normalized_hypothesis = normalize_for_quality_score(hypothesis)
+    if not normalized_reference:
+        return 0.0 if not normalized_hypothesis else 1.0
+    return edit_distance(normalized_reference, normalized_hypothesis) / len(normalized_reference)
+
+
+def selected_quality_samples(samples, settings):
+    count = int_setting(settings, "VOXPRESS_MODEL_GATE_SAMPLE_COUNT", "model_gate_sample_count", 5)
+    count = max(1, count)
+    usable = [sample for sample in samples if str(sample.get("text", "")).strip()]
+    return usable[-count:]
+
+
+def extract_transcription(stdout):
+    for line in reversed(stdout.splitlines()):
+        match = re.search(r'Transcription completed.*: "(.*)"', line)
+        if match:
+            return match.group(1)
+    lines = [line.strip() for line in stdout.splitlines() if line.strip()]
+    return lines[-1] if lines else ""
+
+
+def transcribe_smoke_sample(model_ref, sample, output_dir, prefix, index, strip_initial_prompt=False):
+    smoke_config = write_smoke_config(
+        model_ref,
+        output_dir,
+        f"{prefix}.config.toml",
+        strip_initial_prompt=strip_initial_prompt,
+    )
     cmd = [
         voxtype_bin(),
         "--config",
@@ -518,25 +609,126 @@ def model_smoke_test(model_path, samples, output_dir):
             check=False,
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
-        return False, f"smoke_spawn_failed: {exc}"
+        return {
+            "ok": False,
+            "reason": f"{prefix}_smoke_spawn_failed: {exc}",
+            "text": "",
+            "returncode": None,
+        }
 
-    (output_dir / "model-smoke.stdout.log").write_text(result.stdout, encoding="utf-8")
-    (output_dir / "model-smoke.stderr.log").write_text(result.stderr, encoding="utf-8")
-    if result.returncode != 0:
-        return False, "smoke_command_failed"
-    lines = [line.strip() for line in result.stdout.splitlines() if line.strip()]
-    text = lines[-1] if lines else ""
-    if not text:
-        return False, "smoke_output_empty"
-    if is_degenerate_transcription(text):
-        return False, "smoke_output_degenerate"
+    Path(output_dir).mkdir(parents=True, exist_ok=True)
+    (Path(output_dir) / f"{prefix}-{index:02d}.stdout.log").write_text(result.stdout, encoding="utf-8")
+    (Path(output_dir) / f"{prefix}-{index:02d}.stderr.log").write_text(result.stderr, encoding="utf-8")
+    text = extract_transcription(result.stdout)
+    return {
+        "ok": result.returncode == 0,
+        "reason": "ok" if result.returncode == 0 else f"{prefix}_smoke_command_failed",
+        "text": text,
+        "returncode": result.returncode,
+    }
+
+
+def write_quality_gate_result(output_dir, payload):
+    Path(output_dir).mkdir(parents=True, exist_ok=True)
+    (Path(output_dir) / "model-quality-gate.json").write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+
+
+def model_smoke_test(model_path, samples, output_dir, settings=None):
+    if os.environ.get("VOXPRESS_SKIP_MODEL_SMOKE_TEST", "0") == "1":
+        return True, "skipped"
+    if not samples:
+        return False, "no_smoke_sample"
+    promotable, reason = is_promotable_deploy_model(model_path)
+    if not promotable:
+        return False, reason
+
+    settings = settings or {}
+    gate_samples = selected_quality_samples(samples, settings)
+    if not gate_samples:
+        return False, "no_quality_samples"
+
+    max_error = float_setting(settings, "VOXPRESS_MODEL_GATE_MAX_ERROR", "model_gate_max_error", 0.60)
+    min_improvement = float_setting(
+        settings,
+        "VOXPRESS_MODEL_GATE_MIN_IMPROVEMENT",
+        "model_gate_min_improvement",
+        0.02,
+    )
+    result_payload = {
+        "base_model": base_voxtype_model(),
+        "candidate_model": str(model_path),
+        "candidate_initial_prompt": "disabled",
+        "base_initial_prompt": "from_config",
+        "sample_count": len(gate_samples),
+        "max_error": max_error,
+        "min_improvement": min_improvement,
+        "samples": [],
+    }
+
+    candidate_errors = []
+    base_errors = []
+    for index, sample in enumerate(gate_samples):
+        candidate = transcribe_smoke_sample(
+            model_path,
+            sample,
+            Path(output_dir),
+            "candidate-smoke",
+            index,
+            strip_initial_prompt=True,
+        )
+        if not candidate["ok"]:
+            write_quality_gate_result(output_dir, {**result_payload, "status": "failed", "reason": candidate["reason"]})
+            return False, candidate["reason"]
+        if not candidate["text"]:
+            write_quality_gate_result(output_dir, {**result_payload, "status": "failed", "reason": "smoke_output_empty"})
+            return False, "smoke_output_empty"
+        if is_degenerate_transcription(candidate["text"]):
+            write_quality_gate_result(output_dir, {**result_payload, "status": "failed", "reason": "smoke_output_degenerate"})
+            return False, "smoke_output_degenerate"
+
+        base = transcribe_smoke_sample(base_voxtype_model(), sample, Path(output_dir), "base-smoke", index)
+        if not base["ok"]:
+            write_quality_gate_result(output_dir, {**result_payload, "status": "failed", "reason": base["reason"]})
+            return False, base["reason"]
+
+        candidate_error = transcription_error(sample["text"], candidate["text"])
+        base_error = transcription_error(sample["text"], base["text"])
+        candidate_errors.append(candidate_error)
+        base_errors.append(base_error)
+        result_payload["samples"].append(
+            {
+                "id": sample.get("id"),
+                "reference": sample["text"],
+                "candidate": candidate["text"],
+                "base": base["text"],
+                "candidate_error": candidate_error,
+                "base_error": base_error,
+            }
+        )
+
+    candidate_avg = sum(candidate_errors) / len(candidate_errors)
+    base_avg = sum(base_errors) / len(base_errors)
+    result_payload["candidate_error_avg"] = candidate_avg
+    result_payload["base_error_avg"] = base_avg
+
+    if candidate_avg > base_avg - min_improvement:
+        write_quality_gate_result(output_dir, {**result_payload, "status": "failed", "reason": "quality_gate_not_better_than_base"})
+        return False, "quality_gate_not_better_than_base"
+    if candidate_avg > max_error:
+        write_quality_gate_result(output_dir, {**result_payload, "status": "failed", "reason": "quality_gate_error_too_high"})
+        return False, "quality_gate_error_too_high"
+
+    write_quality_gate_result(output_dir, {**result_payload, "status": "passed", "reason": "ok"})
     return True, "ok"
 
 
-def write_smoke_config(model_path, output_dir):
+def write_smoke_config(model_path, output_dir, filename="model-smoke.config.toml", strip_initial_prompt=False):
     source_path = Path(os.environ.get("VOXTYPE_CONFIG_PATH", DEFAULT_VOXTYPE_CONFIG))
     Path(output_dir).mkdir(parents=True, exist_ok=True)
-    smoke_config = Path(output_dir) / "model-smoke.config.toml"
+    smoke_config = Path(output_dir) / filename
     try:
         content = source_path.read_text(encoding="utf-8")
     except OSError:
@@ -545,6 +737,8 @@ def write_smoke_config(model_path, output_dir):
     update_toml_key(smoke_config, "whisper", "model", json.dumps(str(model_path)))
     update_toml_key(smoke_config, "whisper", "mode", json.dumps("local"))
     remove_toml_key(smoke_config, "whisper", "whisper_cli_path")
+    if strip_initial_prompt:
+        remove_toml_key(smoke_config, "whisper", "initial_prompt")
     return smoke_config
 
 
@@ -613,17 +807,20 @@ def cleanup_after_promotion(active_run_dir):
             artifact.unlink(missing_ok=True)
 
 
-def promote_model(model_path, run_dir=None):
+def promote_model(model_path, run_dir=None, settings=None):
     promotable, _reason = is_promotable_deploy_model(model_path)
     if not promotable:
         return None
     current_model = install_current_model(model_path, run_dir=run_dir)
     config_path = os.environ.get("VOXTYPE_CONFIG_PATH", DEFAULT_VOXTYPE_CONFIG)
     previous = current_toml_key(config_path, "whisper", "model")
-    update_toml_key(config_path, "whisper", "model", json.dumps(str(current_model)))
-    remove_toml_key(config_path, "whisper", "mode")
-    remove_toml_key(config_path, "whisper", "whisper_cli_path")
-    restart_voxtype()
+    if recognition_model_mode(settings or {}) == "personal":
+        backup_initial_prompt(config_path)
+        update_toml_key(config_path, "whisper", "model", json.dumps(str(current_model)))
+        remove_toml_key(config_path, "whisper", "mode")
+        remove_toml_key(config_path, "whisper", "whisper_cli_path")
+        remove_toml_key(config_path, "whisper", "initial_prompt")
+        restart_voxtype()
     record_promotion(str(current_model), previous)
     return str(current_model)
 
@@ -737,13 +934,14 @@ def run_daily(args):
         mark_daily_attempt()
         return {"status": "trained", "reason": "auto_promote_disabled", "model_path": deploy_model_path, "run_dir": str(output_dir)}
 
-    smoke_ok, smoke_reason = model_smoke_test(deploy_model_path, samples, output_dir)
+    smoke_ok, smoke_reason = model_smoke_test(deploy_model_path, samples, output_dir, settings=settings)
     if not smoke_ok:
-        record_training_run(run_id, "smoke_failed", output_dir, deploy_model_path)
+        status = "quality_failed" if smoke_reason.startswith("quality_gate") else "smoke_failed"
+        record_training_run(run_id, status, output_dir, deploy_model_path)
         mark_daily_attempt()
         return {"status": "failed", "reason": smoke_reason, "run_dir": str(output_dir)}
 
-    promoted_model_path = promote_model(deploy_model_path, run_dir=output_dir)
+    promoted_model_path = promote_model(deploy_model_path, run_dir=output_dir, settings=settings)
     if promoted_model_path:
         update_result_after_promotion(output_dir, deploy_model_path, promoted_model_path)
         record_training_run(run_id, "promoted", output_dir, promoted_model_path)
