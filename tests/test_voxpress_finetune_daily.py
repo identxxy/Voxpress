@@ -637,6 +637,43 @@ class VoxpressFinetuneDailyTest(unittest.TestCase):
             "用连续的3帧去跑",
         )
 
+    def test_raw_training_history_is_synced_by_run_date(self):
+        loader = importlib.machinery.SourceFileLoader(
+            "voxpress_finetune_daily_history_sync_test", str(SCRIPT)
+        )
+        spec = importlib.util.spec_from_loader(loader.name, loader)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+
+        previous = os.environ.get("VOXPRESS_TRAINING_HISTORY_DIR")
+        with tempfile.TemporaryDirectory() as tmpdir:
+            base = Path(tmpdir)
+            os.environ["VOXPRESS_TRAINING_HISTORY_DIR"] = str(base / "history")
+            try:
+                run_dir = base / "runs" / "20260608T010203"
+                run_dir.mkdir(parents=True)
+                (run_dir / "train-metrics.jsonl").write_text('{"step": 1}\n', encoding="utf-8")
+                (run_dir / "train.stdout.log").write_text("step=1\n", encoding="utf-8")
+                (run_dir / "model-quality-gate.json").write_text('{"status": "passed"}\n', encoding="utf-8")
+
+                copied = module.sync_raw_training_history(run_dir)
+                raw_dir = base / "history" / "runs" / "2026-06-08" / "20260608T010203"
+
+                self.assertEqual(
+                    copied,
+                    ["train-metrics.jsonl", "train.stdout.log", "model-quality-gate.json"],
+                )
+                self.assertEqual((raw_dir / "train.stdout.log").read_text(encoding="utf-8"), "step=1\n")
+                self.assertEqual(
+                    (raw_dir / "model-quality-gate.json").read_text(encoding="utf-8"),
+                    '{"status": "passed"}\n',
+                )
+            finally:
+                if previous is None:
+                    os.environ.pop("VOXPRESS_TRAINING_HISTORY_DIR", None)
+                else:
+                    os.environ["VOXPRESS_TRAINING_HISTORY_DIR"] = previous
+
 
 if __name__ == "__main__":
     unittest.main()

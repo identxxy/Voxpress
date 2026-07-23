@@ -1,11 +1,13 @@
 #!/usr/bin/python3
 import argparse
+import fcntl
 import json
 import os
 import re
 import subprocess
 import sys
 import tempfile
+import threading
 
 import gi
 
@@ -42,6 +44,14 @@ ENABLE_SCRIPT = os.environ.get(
 )
 DISABLE_SCRIPT = os.environ.get(
     "VOXTYPE_PAUSE_DISABLE", os.path.expanduser("~/.local/bin/voxpress-pause-disable")
+)
+SETTINGS_LOCK_PATH = os.environ.get(
+    "VOXPRESS_SETTINGS_LOCK",
+    os.path.join(
+        os.environ.get("XDG_RUNTIME_DIR", "/tmp"),
+        "voxtype",
+        "voxpress-settings.lock",
+    ),
 )
 
 DEFAULT_SETTINGS = {
@@ -549,18 +559,33 @@ def hide_popup():
 class SettingsDialog(Gtk.Dialog):
     def __init__(self):
         super().__init__(title="Voxpress Settings")
-        self.set_default_size(560, 700)
+        self.set_default_size(620, 720)
+        self.set_resizable(True)
         self.controls = {}
         self.settings = load_settings()
+        self.destroyed = False
+        self.usage_label = None
+        self.connect("destroy", self.on_destroy)
 
         self.add_button("Reset Defaults", 1001)
         self.add_button("Cancel", Gtk.ResponseType.CANCEL)
         self.add_button("Save", Gtk.ResponseType.OK)
 
         content = self.get_content_area()
-        content.set_border_width(14)
+        content.set_border_width(0)
+        scroller = Gtk.ScrolledWindow()
+        scroller.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        scroller.set_hexpand(True)
+        scroller.set_vexpand(True)
+        content.pack_start(scroller, True, True, 0)
+
         grid = Gtk.Grid(column_spacing=12, row_spacing=8)
-        content.add(grid)
+        grid.set_border_width(14)
+        grid.set_hexpand(True)
+        viewport = Gtk.Viewport()
+        viewport.set_shadow_type(Gtk.ShadowType.NONE)
+        viewport.add(grid)
+        scroller.add(viewport)
 
         row = 0
         for key in (
@@ -621,6 +646,9 @@ class SettingsDialog(Gtk.Dialog):
 
         self.show_all()
 
+    def on_destroy(self, *_args):
+        self.destroyed = True
+
     def add_section_label(self, grid, row, text):
         label = Gtk.Label()
         label.set_markup(f"<b>{GLib.markup_escape_text(text)}</b>")
@@ -629,9 +657,20 @@ class SettingsDialog(Gtk.Dialog):
         grid.attach(label, 0, row, 2, 1)
 
     def add_usage_label(self, grid, row):
-        label = Gtk.Label(label=correction_usage_text())
+        label = Gtk.Label(label="Correction data: loading...")
         label.set_xalign(0.0)
         grid.attach(label, 0, row, 2, 1)
+        self.usage_label = label
+        threading.Thread(target=self.load_usage_label, daemon=True).start()
+
+    def load_usage_label(self):
+        text = correction_usage_text()
+        GLib.idle_add(self.set_usage_label_text, text)
+
+    def set_usage_label_text(self, text):
+        if not self.destroyed and self.usage_label is not None:
+            self.usage_label.set_text(text)
+        return False
 
     def add_spin(self, grid, row, key):
         low, high = SETTING_LIMITS[key]
@@ -737,7 +776,7 @@ class VoxtypeIndicator:
         )
         self.indicator.set_status(AppIndicator.IndicatorStatus.ACTIVE)
         self.menu = Gtk.Menu()
-        self.settings_dialog = None
+        self.settings_open_pending = False
         self.build_menu()
         self.indicator.set_menu(self.menu)
         self.refresh()
@@ -758,14 +797,14 @@ class VoxtypeIndicator:
         self.disable_item.connect("activate", self.disable)
         self.menu.append(self.disable_item)
 
-        restart_item = Gtk.MenuItem(label="Restart Listener")
-        restart_item.connect("activate", self.restart)
-        self.menu.append(restart_item)
+        self.restart_item = Gtk.MenuItem(label="Restart Listener")
+        self.restart_item.connect("activate", self.restart)
+        self.menu.append(self.restart_item)
 
         self.menu.append(Gtk.SeparatorMenuItem())
 
         settings_item = Gtk.MenuItem(label="Settings...")
-        settings_item.connect("activate", self.open_settings)
+        settings_item.connect("activate", self.request_open_settings)
         self.menu.append(settings_item)
 
         quit_item = Gtk.MenuItem(label="Quit Indicator")
@@ -778,6 +817,7 @@ class VoxtypeIndicator:
         self.status_item.set_label("Voxpress: Enabled" if active else "Voxpress: Disabled")
         self.enable_item.set_sensitive(not active)
         self.disable_item.set_sensitive(active)
+        self.restart_item.set_sensitive(active)
         icon = "audio-input-microphone" if active else "audio-input-microphone-muted"
         try:
             self.indicator.set_icon_full(icon, self.status_item.get_label())
@@ -803,60 +843,87 @@ class VoxtypeIndicator:
             notify("Voxpress restart failed", result.stderr.strip())
         self.refresh()
 
-    def open_settings(self, *_args):
-        if self.settings_dialog and self.settings_dialog.get_visible():
-            self.settings_dialog.present()
+    def request_open_settings(self, *_args):
+        if self.settings_open_pending:
             return
+        self.settings_open_pending = True
+        GLib.timeout_add(150, self.open_settings)
 
-        dialog = SettingsDialog()
-        self.settings_dialog = dialog
-        dialog.connect("response", self.on_settings_response)
-        dialog.present()
-
-    def on_settings_response(self, dialog, response):
-        if response == 1001:
-            dialog.reset_defaults()
-            return
-
-        if response == Gtk.ResponseType.OK:
-            old_settings = load_settings()
-            collected = dialog.collect()
-            model_error = validate_recognition_model_mode(collected)
-            if model_error:
-                notify("Voxpress model switch failed", model_error)
-                return
-            settings = save_settings(collected)
-            model_changed = apply_voxtype_model(settings)
-            language_changed = apply_voxtype_language(settings)
-            trigger_changed = settings["trigger_key"] != old_settings["trigger_key"]
-            preview_key_changed = (
-                settings["confirm_key"] != old_settings["confirm_key"]
-                or settings["cancel_key"] != old_settings["cancel_key"]
+    def open_settings(self):
+        try:
+            subprocess.Popen(
+                [sys.argv[0], "settings"],
+                stdout=subprocess.DEVNULL,
+                start_new_session=True,
             )
-            listener_restarted = False
-            if trigger_changed:
-                result = systemctl("restart", SERVICE)
-                listener_restarted = result.returncode == 0
-                if result.returncode != 0:
-                    notify("Voxpress listener restart failed", result.stderr.strip())
-            hide_popup()
-            body = "New popup settings apply on the next popup."
-            if model_changed:
-                body += " Voxtype was restarted for the model change."
-            if language_changed:
-                body += " Voxtype was restarted for the language change."
-            if listener_restarted:
-                body += " Listener was restarted for the hold-to-talk key change."
-            elif preview_key_changed:
-                body += " Preview key changes apply on the next preview."
-            notify("Voxpress settings saved", body)
-
-        dialog.destroy()
-        if self.settings_dialog is dialog:
-            self.settings_dialog = None
+        except OSError as exc:
+            notify("Voxpress settings failed", str(exc))
+        self.settings_open_pending = False
+        return False
 
     def quit(self, *_args):
         Gtk.main_quit()
+
+
+def handle_settings_response(dialog, response):
+    if response == 1001:
+        dialog.reset_defaults()
+        return True
+
+    if response == Gtk.ResponseType.OK:
+        old_settings = load_settings()
+        collected = dialog.collect()
+        model_error = validate_recognition_model_mode(collected)
+        if model_error:
+            notify("Voxpress model switch failed", model_error)
+            return True
+        settings = save_settings(collected)
+        model_changed = apply_voxtype_model(settings)
+        language_changed = apply_voxtype_language(settings)
+        trigger_changed = settings["trigger_key"] != old_settings["trigger_key"]
+        preview_key_changed = (
+            settings["confirm_key"] != old_settings["confirm_key"]
+            or settings["cancel_key"] != old_settings["cancel_key"]
+        )
+        listener_restarted = False
+        if trigger_changed:
+            result = systemctl("restart", SERVICE)
+            listener_restarted = result.returncode == 0
+            if result.returncode != 0:
+                notify("Voxpress listener restart failed", result.stderr.strip())
+        hide_popup()
+        body = "New popup settings apply on the next popup."
+        if model_changed:
+            body += " Voxtype was restarted for the model change."
+        if language_changed:
+            body += " Voxtype was restarted for the language change."
+        if listener_restarted:
+            body += " Listener was restarted for the hold-to-talk key change."
+        elif preview_key_changed:
+            body += " Preview key changes apply on the next preview."
+        notify("Voxpress settings saved", body)
+
+    dialog.destroy()
+    Gtk.main_quit()
+    return False
+
+
+def run_settings_dialog():
+    lock_path = os.path.expanduser(SETTINGS_LOCK_PATH)
+    os.makedirs(os.path.dirname(lock_path), exist_ok=True)
+    lock_handle = open(lock_path, "w", encoding="utf-8")
+    try:
+        fcntl.flock(lock_handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        notify("Voxpress settings already open")
+        return 0
+
+    dialog = SettingsDialog()
+    dialog.connect("response", handle_settings_response)
+    dialog.connect("destroy", lambda *_args: Gtk.main_quit())
+    dialog.present()
+    Gtk.main()
+    return 0
 
 
 def run_indicator():
@@ -867,7 +934,7 @@ def run_indicator():
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("command", nargs="?", choices=["run", "status", "check"], default="run")
+    parser.add_argument("command", nargs="?", choices=["run", "settings", "status", "check"], default="run")
     args = parser.parse_args()
 
     if args.command == "status":
@@ -877,6 +944,8 @@ def main():
         settings = load_settings()
         print(json.dumps(settings, ensure_ascii=False, sort_keys=True))
         return 0
+    if args.command == "settings":
+        return run_settings_dialog()
     return run_indicator()
 
 

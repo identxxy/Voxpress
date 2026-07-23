@@ -60,7 +60,8 @@ Runtime dependencies:
 Optional personal-training dependencies:
 
 - NVIDIA GPU tooling, especially `nvidia-smi`, for idle checks.
-- Python environment with `torch`, `transformers`, `peft`, and `soundfile`.
+- Python environment with `torch`, `transformers`, `peft`, `soundfile`, and
+  `tensorboard`.
 - Hugging Face access/cache for the configured base Whisper model.
 
 Optional export tooling for automatic model promotion:
@@ -109,9 +110,12 @@ The installer copies:
   before launching Voxtype
 - desktop launchers to `~/.local/share/applications/`
 
-It keeps `voxtype.service` enabled, but disables the legacy
+It leaves Voxtype as the transcription backend, but disables the legacy
 `voxtype-pause-listener.service` and `voxtype-indicator.service` if they are
-present, because those conflict with the Voxpress listener and tray UI.
+present, because those conflict with the Voxpress listener and tray UI. When
+Voxpress is enabled, `voxtype.service` is started before the listener. When
+Voxpress is disabled from the tray, `voxtype.service` is stopped as well so the
+local Whisper model does not keep GPU memory allocated.
 
 ## Usage
 
@@ -166,9 +170,29 @@ When the personal model is selected, Voxpress removes the original model's
 back. The prompt is useful for the base model, but it can dominate short
 utterances from the fine-tuned GGML model.
 
-Training logs include `train-metrics.jsonl` with per-step average loss. Promotion
-also writes `model-quality-gate.json`, comparing the exported personal model
-against the original model on recent corrected samples.
+Training logs include `train-metrics.jsonl` with per-step average loss and a
+TensorBoard event stream under:
+
+```text
+~/.local/share/voxpress/training-history/tensorboard/YYYY-MM-DD/<run-id>/
+```
+
+Open the full training history with:
+
+```bash
+voxpress-training-tensorboard
+```
+
+Then visit `http://localhost:6006`. The helper uses the configured
+`training_python_path` to find the matching `tensorboard` binary. From a source
+checkout before install, run `scripts/open-training-tensorboard.sh` instead.
+Promotion also writes `model-quality-gate.json`, comparing the exported personal
+model against the original model on recent corrected samples. Raw run logs are
+mirrored under:
+
+```text
+~/.local/share/voxpress/training-history/runs/YYYY-MM-DD/<run-id>/
+```
 
 Useful settings in `~/.config/voxpress/settings.json`:
 
@@ -192,7 +216,10 @@ systemctl --user restart voxpress-indicator.service
 journalctl --user -u voxpress-pause-listener.service -f
 ```
 
-The tray menu can also enable, disable, or restart the listener.
+The tray menu can also enable, disable, or restart the listener. Disabling
+Voxpress stops both `voxpress-pause-listener.service` and `voxtype.service`, so
+the local Whisper model releases its GPU memory. Enabling Voxpress starts
+`voxtype.service` again before starting the listener.
 
 ## Credits
 

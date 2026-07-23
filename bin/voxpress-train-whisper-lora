@@ -13,6 +13,9 @@ from pathlib import Path
 os.environ.setdefault("HF_HUB_DISABLE_XET", "1")
 
 
+DEFAULT_TRAINING_HISTORY_DIR = os.path.expanduser("~/.local/share/voxpress/training-history")
+
+
 def load_manifest(path):
     with open(path, "r", encoding="utf-8") as handle:
         return json.load(handle)
@@ -24,6 +27,88 @@ def write_result(output_dir, payload):
         json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
         encoding="utf-8",
     )
+
+
+def training_history_root():
+    return Path(os.environ.get("VOXPRESS_TRAINING_HISTORY_DIR", DEFAULT_TRAINING_HISTORY_DIR)).expanduser()
+
+
+def run_day_from_run_id(run_id):
+    match = re.match(r"^(\d{4})(\d{2})(\d{2})T", str(run_id or ""))
+    if match:
+        return f"{match.group(1)}-{match.group(2)}-{match.group(3)}"
+    return time.strftime("%Y-%m-%d")
+
+
+def training_history_paths(output_dir):
+    output_path = Path(output_dir)
+    run_id = output_path.name or time.strftime("%Y%m%dT%H%M%S")
+    day = run_day_from_run_id(run_id)
+    root = training_history_root()
+    return {
+        "run_id": run_id,
+        "day": day,
+        "tensorboard_dir": root / "tensorboard" / day / run_id,
+        "raw_dir": root / "runs" / day / run_id,
+    }
+
+
+def copy_history_file(source_path, raw_dir):
+    source = Path(source_path)
+    if not source.is_file():
+        return False
+    raw_dir.mkdir(parents=True, exist_ok=True)
+    target = raw_dir / source.name
+    target.write_bytes(source.read_bytes())
+    return True
+
+
+def sync_raw_training_history(output_dir, history_paths):
+    raw_dir = history_paths["raw_dir"]
+    copied = []
+    for name in (
+        "train-manifest.json",
+        "train-metrics.jsonl",
+        "train-result.json",
+        "train.stdout.log",
+        "train.stderr.log",
+        "model-quality-gate.json",
+    ):
+        if copy_history_file(Path(output_dir) / name, raw_dir):
+            copied.append(name)
+    return copied
+
+
+def add_metric_to_tensorboard(writer, metric):
+    if writer is None:
+        return
+    step = int(metric["step"])
+    for key in ("loss_avg", "loss_total", "microbatches", "samples_seen"):
+        if key in metric:
+            writer.add_scalar(f"train/{key}", float(metric[key]), step)
+    writer.flush()
+
+
+def add_result_to_tensorboard(writer, result_payload):
+    if writer is None:
+        return
+    summary = result_payload.get("train_metrics_summary") or {}
+    for key in ("initial_loss_avg", "final_loss_avg", "min_loss_avg", "max_loss_avg", "mean_loss_avg"):
+        if key in summary:
+            writer.add_scalar(f"summary/{key}", float(summary[key]), 0)
+    if "sample_count" in result_payload:
+        writer.add_scalar("summary/sample_count", float(result_payload["sample_count"]), 0)
+    train_config = result_payload.get("train_config") or {}
+    if train_config:
+        writer.add_text("run/train_config", json.dumps(train_config, ensure_ascii=False, indent=2), 0)
+    writer.flush()
+
+
+def create_tensorboard_writer(log_dir):
+    from torch.utils.tensorboard import SummaryWriter
+
+    Path(log_dir).mkdir(parents=True, exist_ok=True)
+    return SummaryWriter(log_dir=str(log_dir))
 
 
 def run_dry(args):
@@ -58,7 +143,7 @@ def run_dry(args):
 
 def require_training_dependencies():
     missing = []
-    for module in ("torch", "transformers", "peft", "soundfile"):
+    for module in ("torch", "transformers", "peft", "soundfile", "tensorboard"):
         try:
             __import__(module)
         except ImportError:
@@ -214,6 +299,8 @@ def run_real(args):
 
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
+    history_paths = training_history_paths(output_dir)
+    tensorboard_writer = create_tensorboard_writer(history_paths["tensorboard_dir"])
     metrics_path = output_dir / "train-metrics.jsonl"
     metrics = []
     optimizer = torch.optim.AdamW(
@@ -225,83 +312,83 @@ def run_real(args):
     samples_seen = 0
     sample_limit = sample_presentation_limit(len(prepared), args.max_epochs)
     train_deadline = time.monotonic() + max(1, args.max_minutes) * 60
-    with metrics_path.open("w", encoding="utf-8") as metrics_handle:
-        for step in range(args.max_steps):
-            if sample_limit is not None and samples_seen >= sample_limit:
-                print(f"Stopping training at max_epochs={args.max_epochs}", flush=True)
-                break
-            if step > 0 and time.monotonic() >= train_deadline:
-                print(f"Stopping training at max_minutes={args.max_minutes}", flush=True)
-                break
-            optimizer.zero_grad(set_to_none=True)
-            total_loss = 0.0
-            accumulated = 0
-            for _ in range(max(1, args.gradient_accumulation_steps)):
+    try:
+        with metrics_path.open("w", encoding="utf-8") as metrics_handle:
+            for step in range(args.max_steps):
                 if sample_limit is not None and samples_seen >= sample_limit:
+                    print(f"Stopping training at max_epochs={args.max_epochs}", flush=True)
                     break
-                batch_items = []
-                for _batch_index in range(max(1, args.batch_size)):
+                if step > 0 and time.monotonic() >= train_deadline:
+                    print(f"Stopping training at max_minutes={args.max_minutes}", flush=True)
+                    break
+                optimizer.zero_grad(set_to_none=True)
+                total_loss = 0.0
+                accumulated = 0
+                for _ in range(max(1, args.gradient_accumulation_steps)):
                     if sample_limit is not None and samples_seen >= sample_limit:
                         break
-                    batch_items.append(prepared[sample_index % len(prepared)])
-                    sample_index += 1
-                    samples_seen += 1
-                if not batch_items:
+                    batch_items = []
+                    for _batch_index in range(max(1, args.batch_size)):
+                        if sample_limit is not None and samples_seen >= sample_limit:
+                            break
+                        batch_items.append(prepared[sample_index % len(prepared)])
+                        sample_index += 1
+                        samples_seen += 1
+                    if not batch_items:
+                        break
+                    batch = collate(batch_items)
+                    batch = {
+                        key: value.to(device)
+                        for key, value in batch.items()
+                    }
+                    batch["input_features"] = batch["input_features"].to(dtype=dtype)
+                    loss = model(**batch).loss / max(1, args.gradient_accumulation_steps)
+                    if not torch.isfinite(loss):
+                        raise RuntimeError(f"Non-finite training loss at step {step + 1}: {loss}")
+                    loss.backward()
+                    total_loss += float(loss.detach().cpu()) * max(1, args.gradient_accumulation_steps)
+                    accumulated += 1
+                if accumulated == 0:
                     break
-                batch = collate(batch_items)
-                batch = {
-                    key: value.to(device)
-                    for key, value in batch.items()
+                torch.nn.utils.clip_grad_norm_(
+                    [parameter for parameter in model.parameters() if parameter.requires_grad],
+                    max_norm=1.0,
+                )
+                optimizer.step()
+                for name, parameter in model.named_parameters():
+                    if parameter.requires_grad and not torch.isfinite(parameter).all():
+                        raise RuntimeError(f"Non-finite trainable parameter after step {step + 1}: {name}")
+                loss_avg = total_loss / max(1, accumulated)
+                metric = {
+                    "step": step + 1,
+                    "loss_avg": loss_avg,
+                    "loss_total": total_loss,
+                    "microbatches": accumulated,
+                    "samples_seen": samples_seen,
                 }
-                batch["input_features"] = batch["input_features"].to(dtype=dtype)
-                loss = model(**batch).loss / max(1, args.gradient_accumulation_steps)
-                if not torch.isfinite(loss):
-                    raise RuntimeError(f"Non-finite training loss at step {step + 1}: {loss}")
-                loss.backward()
-                total_loss += float(loss.detach().cpu()) * max(1, args.gradient_accumulation_steps)
-                accumulated += 1
-            if accumulated == 0:
-                break
-            torch.nn.utils.clip_grad_norm_(
-                [parameter for parameter in model.parameters() if parameter.requires_grad],
-                max_norm=1.0,
-            )
-            optimizer.step()
-            for name, parameter in model.named_parameters():
-                if parameter.requires_grad and not torch.isfinite(parameter).all():
-                    raise RuntimeError(f"Non-finite trainable parameter after step {step + 1}: {name}")
-            loss_avg = total_loss / max(1, accumulated)
-            metric = {
-                "step": step + 1,
-                "loss_avg": loss_avg,
-                "loss_total": total_loss,
-                "microbatches": accumulated,
-                "samples_seen": samples_seen,
-            }
-            metrics.append(metric)
-            metrics_handle.write(json.dumps(metric, ensure_ascii=False, sort_keys=True) + "\n")
-            metrics_handle.flush()
-            print(
-                f"step={step + 1} loss_avg={loss_avg:.6f} "
-                f"loss_total={total_loss:.6f} samples_seen={samples_seen}",
-                flush=True,
-            )
+                metrics.append(metric)
+                metrics_handle.write(json.dumps(metric, ensure_ascii=False, sort_keys=True) + "\n")
+                metrics_handle.flush()
+                add_metric_to_tensorboard(tensorboard_writer, metric)
+                print(
+                    f"step={step + 1} loss_avg={loss_avg:.6f} "
+                    f"loss_total={total_loss:.6f} samples_seen={samples_seen}",
+                    flush=True,
+                )
 
-    adapter_dir = output_dir / "adapter"
-    model.save_pretrained(adapter_dir)
-    processor.save_pretrained(output_dir / "processor")
+        adapter_dir = output_dir / "adapter"
+        model.save_pretrained(adapter_dir)
+        processor.save_pretrained(output_dir / "processor")
 
-    export_result = run_exporter(
-        args,
-        adapter_dir=adapter_dir,
-        processor_dir=output_dir / "processor",
-        output_dir=output_dir / "deploy",
-    )
-    deploy_model_path = export_result.get("deploy_model_path")
+        export_result = run_exporter(
+            args,
+            adapter_dir=adapter_dir,
+            processor_dir=output_dir / "processor",
+            output_dir=output_dir / "deploy",
+        )
+        deploy_model_path = export_result.get("deploy_model_path")
 
-    write_result(
-        output_dir,
-        {
+        result_payload = {
             "status": "trained",
             "adapter_dir": str(adapter_dir),
             "deploy_model_path": deploy_model_path,
@@ -324,8 +411,14 @@ def run_real(args):
             },
             "max_epochs": args.max_epochs,
             "sample_count": len(samples),
-        },
-    )
+            "training_history_tensorboard_dir": str(history_paths["tensorboard_dir"]),
+            "training_history_raw_dir": str(history_paths["raw_dir"]),
+        }
+        add_result_to_tensorboard(tensorboard_writer, result_payload)
+        write_result(output_dir, result_payload)
+        sync_raw_training_history(output_dir, history_paths)
+    finally:
+        tensorboard_writer.close()
     return 0
 
 

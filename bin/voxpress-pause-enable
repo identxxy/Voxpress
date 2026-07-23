@@ -1,5 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-systemctl --user enable --now voxpress-pause-listener.service >/dev/null
-/usr/bin/notify-send -a Voxpress "Voxpress enabled" "Hold the configured key to dictate."
+SYSTEMCTL="${VOXPRESS_SYSTEMCTL:-systemctl}"
+NOTIFY_SEND="${VOXPRESS_NOTIFY_SEND:-/usr/bin/notify-send}"
+VOXTYPE_SERVICE="${VOXPRESS_VOXTYPE_SERVICE:-voxtype.service}"
+LISTENER_SERVICE="${VOXPRESS_LISTENER_SERVICE:-voxpress-pause-listener.service}"
+
+"$SYSTEMCTL" --user enable --now "$VOXTYPE_SERVICE" >/dev/null
+"$SYSTEMCTL" --user enable --now "$LISTENER_SERVICE" >/dev/null
+"$NOTIFY_SEND" -a Voxpress "Voxpress enabled" "Voxtype is running. Hold the configured key to dictate."

@@ -11,6 +11,7 @@ APPLICATIONS_DIR="${HOME}/.local/share/applications"
 mkdir -p "$BIN_DIR" "$CONFIG_DIR" "$SYSTEMD_USER_DIR" "$APPLICATIONS_DIR"
 
 install -m 755 "$ROOT"/bin/voxpress-* "$BIN_DIR"/
+install -m 755 "$ROOT/scripts/open-training-tensorboard.sh" "$BIN_DIR/voxpress-training-tensorboard"
 
 if [[ ! -f "$CONFIG_DIR/settings.json" ]]; then
   install -m 644 "$ROOT/config/settings.example.json" "$CONFIG_DIR/settings.json"

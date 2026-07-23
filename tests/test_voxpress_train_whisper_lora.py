@@ -1,6 +1,7 @@
 import importlib.machinery
 import importlib.util
 import os
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -83,6 +84,72 @@ class VoxpressTrainWhisperLoraTest(unittest.TestCase):
         self.assertEqual(module.tokenizer_language_for_text("hello world", "zh_en"), "en")
         self.assertEqual(module.tokenizer_language_for_text("你好 world", "zh_en"), "zh")
         self.assertEqual(module.processor_default_language("zh_en"), "zh")
+
+    def test_training_history_paths_use_run_date(self):
+        loader = importlib.machinery.SourceFileLoader(
+            "voxpress_train_whisper_lora_history_path_test", str(SCRIPT)
+        )
+        spec = importlib.util.spec_from_loader(loader.name, loader)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+
+        previous = os.environ.get("VOXPRESS_TRAINING_HISTORY_DIR")
+        with tempfile.TemporaryDirectory() as tmpdir:
+            os.environ["VOXPRESS_TRAINING_HISTORY_DIR"] = tmpdir
+            try:
+                paths = module.training_history_paths(Path("/tmp/runs/20260608T010203"))
+            finally:
+                if previous is None:
+                    os.environ.pop("VOXPRESS_TRAINING_HISTORY_DIR", None)
+                else:
+                    os.environ["VOXPRESS_TRAINING_HISTORY_DIR"] = previous
+
+        self.assertEqual(paths["run_id"], "20260608T010203")
+        self.assertEqual(paths["day"], "2026-06-08")
+        self.assertEqual(paths["tensorboard_dir"], Path(tmpdir) / "tensorboard" / "2026-06-08" / "20260608T010203")
+        self.assertEqual(paths["raw_dir"], Path(tmpdir) / "runs" / "2026-06-08" / "20260608T010203")
+
+    def test_tensorboard_metric_writer_uses_stable_scalar_names(self):
+        loader = importlib.machinery.SourceFileLoader(
+            "voxpress_train_whisper_lora_tensorboard_metric_test", str(SCRIPT)
+        )
+        spec = importlib.util.spec_from_loader(loader.name, loader)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+
+        class FakeWriter:
+            def __init__(self):
+                self.scalars = []
+                self.flushes = 0
+
+            def add_scalar(self, name, value, step):
+                self.scalars.append((name, value, step))
+
+            def flush(self):
+                self.flushes += 1
+
+        writer = FakeWriter()
+        module.add_metric_to_tensorboard(
+            writer,
+            {
+                "step": 7,
+                "loss_avg": 0.5,
+                "loss_total": 4.0,
+                "microbatches": 8,
+                "samples_seen": 56,
+            },
+        )
+
+        self.assertEqual(
+            writer.scalars,
+            [
+                ("train/loss_avg", 0.5, 7),
+                ("train/loss_total", 4.0, 7),
+                ("train/microbatches", 8.0, 7),
+                ("train/samples_seen", 56.0, 7),
+            ],
+        )
+        self.assertEqual(writer.flushes, 1)
 
 
 if __name__ == "__main__":

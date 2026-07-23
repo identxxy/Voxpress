@@ -101,12 +101,20 @@ Project-level guidance for agents working on Voxpress.
     English decoder prompt tokens, while CJK text gets Chinese prompt tokens.
   - Default LoRA strategy is rank 32, alpha 64, dropout 0, target modules
     `q_proj,k_proj,v_proj,out_proj`, and learning rate `1e-4`.
-  - Uses `torch`, `transformers`, `peft`, and `soundfile`.
+  - Uses `torch`, `transformers`, `peft`, `soundfile`, and `tensorboard`.
   - Training stops when either `--max-minutes` or `--max-epochs` is reached.
     The epoch cap prevents tiny correction sets from replaying for the whole
     wall-clock budget.
-  - Writes adapter, processor, export logs, and `train-result.json` into the
-    timestamped run directory.
+  - Writes adapter, processor, export logs, `train-result.json`, and
+    `train-metrics.jsonl` into the timestamped run directory.
+  - Also writes TensorBoard events under
+    `~/.local/share/voxpress/training-history/tensorboard/YYYY-MM-DD/<run-id>/`.
+
+- `scripts/open-training-tensorboard.sh`
+  - Opens TensorBoard against the stable Voxpress training history root.
+  - `scripts/install.sh` installs it as `voxpress-training-tensorboard`.
+  - Resolves the TensorBoard binary from `VOXPRESS_TENSORBOARD_BIN`, then from
+    the configured `training_python_path`, then from `PATH`.
 
 - `bin/voxpress-export-whisper-deploy`
   - Merges LoRA into the base Hugging Face Whisper model.
@@ -133,6 +141,9 @@ Project-level guidance for agents working on Voxpress.
 - `bin/voxpress-indicator`
   - Ayatana AppIndicator tray UI.
   - Provides enable/disable/restart/settings.
+  - Enable starts `voxtype.service` before `voxpress-pause-listener.service`.
+    Disable stops and disables both services so the local Whisper model releases
+    GPU memory while pause input is off.
   - Settings dialog writes `~/.config/voxpress/settings.json`.
   - Language changes update `~/.config/voxtype/config.toml` and restart
     `voxtype.service`.
@@ -159,7 +170,8 @@ Python runtime package:
 
 Personal training dependencies:
 
-- Python env with `torch`, `transformers`, `peft`, and `soundfile`.
+- Python env with `torch`, `transformers`, `peft`, `soundfile`, and
+  `tensorboard`.
 - `nvidia-smi` if automatic GPU-idle gating is enabled.
 - Hugging Face access/cache for the configured base model, default
   `openai/whisper-large-v3-turbo`.
@@ -266,6 +278,8 @@ Daily scheduler and promotion:
 - `VOXPRESS_NVIDIA_SMI`: explicit `nvidia-smi` binary/path for GPU checks.
 - `VOXPRESS_MODEL_RUNS_DIR`: timestamped training workspace root; defaults to
   `~/.local/share/voxpress/models/runs`.
+- `VOXPRESS_TRAINING_HISTORY_DIR`: stable training history root; defaults to
+  `~/.local/share/voxpress/training-history`.
 - `VOXPRESS_CURRENT_MODEL_PATH`: stable promoted GGML model path; defaults to
   `~/.local/share/voxpress/models/current/voxpress-personal-whisper.bin`.
 - `VOXPRESS_INITIAL_PROMPT_BACKUP`: path used to store the base model
@@ -288,6 +302,10 @@ Daily scheduler and promotion:
 - `VOXPRESS_SYSTEMCTL`: `systemctl` path/command used to restart Voxtype.
 - `VOXPRESS_WHISPER_CLI_WRAPPER`: wrapper path used to identify non-promotable
   dry-run or CLI-wrapper artifacts.
+- `VOXPRESS_TENSORBOARD_BIN`: explicit TensorBoard binary for
+  `scripts/open-training-tensorboard.sh`.
+- `VOXPRESS_TENSORBOARD_PORT`: TensorBoard port for the helper script; default
+  6006.
 
 LoRA training:
 
@@ -378,6 +396,10 @@ Default data paths:
   `~/.local/share/voxpress/corrections/auto_train_state.json`.
 - Training runs:
   `~/.local/share/voxpress/models/runs/<timestamp>/`.
+- TensorBoard history:
+  `~/.local/share/voxpress/training-history/tensorboard/YYYY-MM-DD/<run-id>/`.
+- Raw training history mirror:
+  `~/.local/share/voxpress/training-history/runs/YYYY-MM-DD/<run-id>/`.
 - Stable promoted model:
   `~/.local/share/voxpress/models/current/voxpress-personal-whisper.bin`.
 - Stable promoted metadata:
@@ -391,6 +413,8 @@ Training run contents:
 - `train.stdout.log` / `train.stderr.log`: scheduler-captured trainer logs.
 - `train-metrics.jsonl`: per-step training metrics with average loss, total
   accumulated loss, microbatch count, and sample count.
+- TensorBoard events are written in the stable history root for each run, so
+  they remain browsable even after large run-local artifacts are pruned.
 - `adapter/`: PEFT LoRA adapter, temporary after successful promotion.
 - `processor/`: matching Whisper processor, temporary after successful
   promotion.
@@ -406,6 +430,9 @@ Training run contents:
 - `model-quality-gate.json`: corrected-sample promotion gate result comparing
   candidate and baseline transcriptions.
 - `train-result.json`: source of truth for train/export/promotion result.
+- Stable raw history mirrors copy `train-manifest.json`, `train-metrics.jsonl`,
+  `train-result.json`, scheduler stdout/stderr logs, and
+  `model-quality-gate.json` when present.
 
 ## Settings Schema
 
@@ -519,7 +546,7 @@ Run these after meaningful edits:
 ```bash
 python -m py_compile bin/voxpress-popup-ui bin/voxpress-pause-listener bin/voxpress-indicator bin/voxpress-postprocess-preview bin/voxpress-correction-store bin/voxpress-finetune-daily bin/voxpress-train-whisper-lora bin/voxpress-export-whisper-deploy bin/voxpress-whisper-cli-wrapper bin/voxpress-run-with-user-env
 python -m unittest tests/test_voxpress_postprocess.py tests/test_voxpress_popup_ui.py tests/test_voxpress_listener_audio.py tests/test_voxpress_paste_x11.py tests/test_voxpress_correction_store.py tests/test_voxpress_finetune_daily.py tests/test_voxpress_export_whisper_deploy.py tests/test_voxpress_train_whisper_lora.py
-bash -n bin/voxpress-paste-x11 scripts/install.sh scripts/doctor.sh scripts/install-training-tools.sh
+bash -n bin/voxpress-paste-x11 scripts/install.sh scripts/doctor.sh scripts/install-training-tools.sh scripts/open-training-tensorboard.sh
 bin/voxpress-indicator check
 bin/voxpress-popup-ui ping
 ```

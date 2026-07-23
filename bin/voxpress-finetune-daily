@@ -20,6 +20,7 @@ DEFAULT_CORRECTION_DIR = os.path.expanduser("~/.local/share/voxpress/corrections
 DEFAULT_RUNS_DIR = os.path.expanduser("~/.local/share/voxpress/models/runs")
 DEFAULT_VOXTYPE_CONFIG = os.path.expanduser("~/.config/voxtype/config.toml")
 DEFAULT_INITIAL_PROMPT_BACKUP = os.path.expanduser("~/.config/voxpress/base-initial-prompt.txt")
+DEFAULT_TRAINING_HISTORY_DIR = os.path.expanduser("~/.local/share/voxpress/training-history")
 
 
 def print_json(payload):
@@ -100,6 +101,57 @@ def current_model_path():
     if configured:
         return Path(configured).expanduser()
     return runs_root().parent / "current" / "voxpress-personal-whisper.bin"
+
+
+def training_history_root():
+    return Path(os.environ.get("VOXPRESS_TRAINING_HISTORY_DIR", DEFAULT_TRAINING_HISTORY_DIR)).expanduser()
+
+
+def run_day_from_run_id(run_id):
+    match = re.match(r"^(\d{4})(\d{2})(\d{2})T", str(run_id or ""))
+    if match:
+        return f"{match.group(1)}-{match.group(2)}-{match.group(3)}"
+    return datetime.now().strftime("%Y-%m-%d")
+
+
+def training_history_paths(run_dir):
+    run_path = Path(run_dir)
+    run_id = run_path.name or datetime.now().strftime("%Y%m%dT%H%M%S")
+    day = run_day_from_run_id(run_id)
+    root = training_history_root()
+    return {
+        "run_id": run_id,
+        "day": day,
+        "tensorboard_dir": root / "tensorboard" / day / run_id,
+        "raw_dir": root / "runs" / day / run_id,
+    }
+
+
+def copy_history_file(source_path, raw_dir):
+    source = Path(source_path)
+    if not source.is_file():
+        return False
+    raw_dir.mkdir(parents=True, exist_ok=True)
+    target = raw_dir / source.name
+    target.write_bytes(source.read_bytes())
+    return True
+
+
+def sync_raw_training_history(run_dir):
+    run_path = Path(run_dir)
+    raw_dir = training_history_paths(run_path)["raw_dir"]
+    copied = []
+    for name in (
+        "train-manifest.json",
+        "train-metrics.jsonl",
+        "train-result.json",
+        "train.stdout.log",
+        "train.stderr.log",
+        "model-quality-gate.json",
+    ):
+        if copy_history_file(run_path / name, raw_dir):
+            copied.append(name)
+    return copied
 
 
 def initial_prompt_backup_path():
@@ -893,17 +945,21 @@ def run_daily(args):
         )
     except subprocess.TimeoutExpired:
         record_training_run(run_id, "train_timeout", output_dir)
+        sync_raw_training_history(output_dir)
         mark_daily_attempt()
         return {"status": "failed", "reason": "train_timeout", "run_dir": str(output_dir)}
     except OSError as exc:
         record_training_run(run_id, "train_spawn_failed", output_dir)
+        sync_raw_training_history(output_dir)
         mark_daily_attempt()
         return {"status": "failed", "reason": f"train_spawn_failed: {exc}", "run_dir": str(output_dir)}
 
     (output_dir / "train.stdout.log").write_text(result.stdout, encoding="utf-8")
     (output_dir / "train.stderr.log").write_text(result.stderr, encoding="utf-8")
+    sync_raw_training_history(output_dir)
     if result.returncode != 0:
         record_training_run(run_id, "train_failed", output_dir)
+        sync_raw_training_history(output_dir)
         mark_daily_attempt()
         return {"status": "failed", "reason": "train_failed", "run_dir": str(output_dir)}
 
@@ -911,6 +967,7 @@ def run_daily(args):
     deploy_model_path = train_result.get("deploy_model_path")
     if not deploy_model_path:
         record_training_run(run_id, "trained_not_deployable", output_dir)
+        sync_raw_training_history(output_dir)
         mark_daily_attempt()
         return {
             "status": "trained",
@@ -921,6 +978,7 @@ def run_daily(args):
     promotable, promotable_reason = is_promotable_deploy_model(deploy_model_path)
     if not promotable:
         record_training_run(run_id, "trained_not_deployable", output_dir, deploy_model_path)
+        sync_raw_training_history(output_dir)
         mark_daily_attempt()
         return {
             "status": "trained",
@@ -931,13 +989,16 @@ def run_daily(args):
 
     if not bool_setting(settings, "VOXPRESS_AUTO_PROMOTE_MODEL", "auto_promote_model", True):
         record_training_run(run_id, "trained_not_promoted", output_dir, deploy_model_path)
+        sync_raw_training_history(output_dir)
         mark_daily_attempt()
         return {"status": "trained", "reason": "auto_promote_disabled", "model_path": deploy_model_path, "run_dir": str(output_dir)}
 
     smoke_ok, smoke_reason = model_smoke_test(deploy_model_path, samples, output_dir, settings=settings)
+    sync_raw_training_history(output_dir)
     if not smoke_ok:
         status = "quality_failed" if smoke_reason.startswith("quality_gate") else "smoke_failed"
         record_training_run(run_id, status, output_dir, deploy_model_path)
+        sync_raw_training_history(output_dir)
         mark_daily_attempt()
         return {"status": "failed", "reason": smoke_reason, "run_dir": str(output_dir)}
 
@@ -945,10 +1006,12 @@ def run_daily(args):
     if promoted_model_path:
         update_result_after_promotion(output_dir, deploy_model_path, promoted_model_path)
         record_training_run(run_id, "promoted", output_dir, promoted_model_path)
+        sync_raw_training_history(output_dir)
         mark_daily_attempt()
         cleanup_after_promotion(output_dir)
         return {"status": "promoted", "model_path": promoted_model_path, "run_dir": str(output_dir)}
     record_training_run(run_id, "promotion_failed", output_dir, deploy_model_path)
+    sync_raw_training_history(output_dir)
     mark_daily_attempt()
     return {"status": "failed", "reason": "promotion_failed", "run_dir": str(output_dir)}
 

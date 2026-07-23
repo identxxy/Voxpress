@@ -1,7 +1,15 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-voxpress-popup-ui hide >/dev/null 2>&1 || true
-voxtype record cancel >/dev/null 2>&1 || true
-systemctl --user disable --now voxpress-pause-listener.service >/dev/null
-/usr/bin/notify-send -a Voxpress "Voxpress disabled" "The configured key will no longer trigger dictation."
+SYSTEMCTL="${VOXPRESS_SYSTEMCTL:-systemctl}"
+NOTIFY_SEND="${VOXPRESS_NOTIFY_SEND:-/usr/bin/notify-send}"
+VOXTYPE_BIN="${VOXTYPE_BIN:-voxtype}"
+POPUP_UI="${VOXTYPE_POPUP_UI:-voxpress-popup-ui}"
+VOXTYPE_SERVICE="${VOXPRESS_VOXTYPE_SERVICE:-voxtype.service}"
+LISTENER_SERVICE="${VOXPRESS_LISTENER_SERVICE:-voxpress-pause-listener.service}"
+
+"$POPUP_UI" hide >/dev/null 2>&1 || true
+"$VOXTYPE_BIN" record cancel >/dev/null 2>&1 || true
+"$SYSTEMCTL" --user disable --now "$LISTENER_SERVICE" >/dev/null
+"$SYSTEMCTL" --user disable --now "$VOXTYPE_SERVICE" >/dev/null
+"$NOTIFY_SEND" -a Voxpress "Voxpress disabled" "Input is disabled and Voxtype was stopped to release GPU memory."
